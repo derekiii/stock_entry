@@ -1,0 +1,5 @@
+yfinance
+pandas
+cloudscraper
+beautifulsoup4
+plotly
