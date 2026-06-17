@@ -60,11 +60,11 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS ---
+# --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS & HEADER SECTOR ---
 def scrape_finviz_fallback_data(ticker):
     """
-    Scrapes Finviz to extract fundamental valuation metrics (Sector, P/E, Forward P/E, PEG)
-    when alternative financial data pipelines return missing structures.
+    Scrapes Finviz to extract fundamental valuation metrics (P/E, Forward P/E, PEG)
+    and targets the top-left quote header region to extract Sector and Industry.
     """
     fallback = {
         "sector": "N/A",
@@ -82,14 +82,35 @@ def scrape_finviz_fallback_data(ticker):
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 1. Isolate Sector metadata out of breadcrumb track header map
-        breadcrumb_container = soup.find("td", class_="fullview-links")
-        if breadcrumb_container:
-            links = breadcrumb_container.find_all("a")
-            if links:
-                fallback["sector"] = links[0].text.strip()
+        # 1. Target the top-left header zone containing Sector • Industry
+        # Finviz wraps the top-left summary fields in a link layout pool or typography blocks.
+        # We can scan for a text block containing the bullet separator '•' in links near the title info.
+        header_links = soup.find_all("a", class_="tab-link")
+        parsed_sector_components = []
         
-        # 2. Extract fundamental ratio values from the large snapshot metrics table grid
+        for link in header_links:
+            href_attr = link.get("href", "")
+            # Finviz group classification search layout links contain 'screener.ashx?v=111&f=sec_' or 'ind_'
+            if "screener.ashx?v=111" in href_attr and ("f=sec_" in href_attr or "f=ind_" in href_attr):
+                txt = link.text.strip()
+                if txt and txt not in parsed_sector_components:
+                    parsed_sector_components.append(txt)
+                    
+        if parsed_sector_components:
+            # Combine components (e.g., ['Technology', 'Semiconductors'] -> 'Technology - Semiconductors')
+            fallback["sector"] = " - ".join(parsed_sector_components)
+        else:
+            # Multi-strategy search backup: parse direct text lookups for the "•" sequence
+            all_text_nodes = soup.find_all(text=True)
+            for node in all_text_nodes:
+                if "•" in node:
+                    parts = [p.strip() for p in node.split("•") if p.strip()]
+                    # Ensure it looks like a valid sector block instead of numbers or time strings
+                    if len(parts) >= 2 and not any(char.isdigit() for char in parts[0]):
+                        fallback["sector"] = " - ".join(parts)
+                        break
+        
+        # 2. Extract fundamental ratio values from the main metrics layout snapshot table
         snapshot_table = soup.find("table", class_="snapshot-table2")
         if snapshot_table:
             cells = snapshot_table.find_all("td")
@@ -133,7 +154,7 @@ def scrape_marketbeat_fallback_data(ticker):
         soup = BeautifulSoup(response.text, 'html.parser')
         text_content = soup.get_text()
         
-        # 1. Scrape Sector metadata out of fallback body patterns
+        # 1. Scrape Sector metadata out of body patterns
         sector_match = re.search(r'is a\s+([^,.]+)\s+company', text_content, re.IGNORECASE)
         if sector_match:
             fallback["sector"] = sector_match.group(1).strip()
@@ -231,7 +252,6 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
                 if pasts: pst_dt = pasts[-1]
     except Exception: pass
 
-    # If Yahoo failed to retrieve timeline coordinates, inject MarketBeat's data layer
     if not pst_dt and mb_fallback["past_earnings_date"]:
         pst_dt = mb_fallback["past_earnings_date"]
     if not nxt_dt and mb_fallback["next_earnings_date"]:
@@ -247,7 +267,6 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
         profile["next_days_val"] = (nxt_dt - today_date).days
         profile["next_days"] = f"{profile['next_days_val']}d away" if profile['next_days_val'] > 0 else "Today"
 
-    # Financial Statements Quarter-over-Quarter Trend Checklist
     try:
         q_income = cached_financials
         if q_income is not None and not q_income.empty and "Net Income" in q_income.index:
@@ -270,7 +289,6 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
 
-# Dark Theme Injector via CSS
 st.markdown("""
     <style>
         .stApp { background-color: #121212; color: #ffffff; }
@@ -311,7 +329,6 @@ if ticker_input:
             ema50 = float(full_df["EMA50"].iloc[-1])
             ema200 = float(full_df["EMA200"].iloc[-1])
             
-            # Formulate Exponential Average Volatility Matrix (ATR 14)
             tr = pd.concat([
                 full_df["High"] - full_df["Low"], 
                 (full_df["High"] - full_df["Close"].shift()).abs(), 
@@ -321,41 +338,42 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            # Trigger Background Fallback Scraping Channels Ahead of UI Mapping Matrix
+            # Run background multi-channel fallback engines
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
-            # Multi-Channel Resolution: Sector Info
+            # Resolve Sector/Industry using corrected top-left header scraper priority
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
             detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
+            
             if detailed_sector_str == "N/A" or not info:
+                # Prioritize Finviz parsed header text block over generic site strings
                 detailed_sector_str = finviz_data["sector"] if finviz_data["sector"] != "N/A" else mb_data["sector"]
                 
-            # Multi-Channel Resolution: Trailing P/E
+            # Resolve Trailing P/E
             trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
             if trailing_pe == "N/A": 
                 trailing_pe = finviz_data["trailing_pe"]
             if trailing_pe == "N/A": 
                 trailing_pe = mb_data["trailing_pe"]
                 
-            # Multi-Channel Resolution: Forward P/E
+            # Resolve Forward P/E
             forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
             if forward_pe == "N/A":
                 forward_pe = finviz_data["forward_pe"]
                 
-            # Multi-Channel Resolution: PEG Ratio
+            # Resolve PEG Ratio
             peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
             if peg_ratio == "N/A":
                 peg_ratio = finviz_data["peg_ratio"]
                 
             target_mean_price = info.get("targetMeanPrice") if info else None
             
-            # Multi-Channel Resolution: MATP Price & Earnings Timelines
+            # Resolve Consensus Price targets & Earnings lines
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             earn = get_earnings_profile(calendar, quarterly_income, mb_data)
             
-            # Metric HTML Highlight Styler Engine
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)):
                     return f"`{val}`"
@@ -378,7 +396,6 @@ if ticker_input:
             last_earn_styled = style_earnings_date(earn["past_date"], earn["past_elapsed"], earn["past_days_val"])
             next_earn_styled = style_earnings_date(earn["next_date"], earn["next_days"], earn["next_days_val"])
 
-            # Render Layout Splits
             workspace_left, workspace_right = st.columns([1, 1.2])
             
             with workspace_left:
@@ -475,7 +492,6 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
-                # Keep the chart lines mapped inside the legend frame to keep the canvas view clean
                 fig.add_trace(go.Scatter(
                     x=[chart_df.index.min(), chart_df.index.max()],
                     y=[target_val, target_val],
