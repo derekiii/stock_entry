@@ -365,10 +365,9 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
-                # Updated textposition coordinates to cleanly align on the left margin bounding grid
-                fig.add_hline(y=target_val, line_color="#00e5ff", line_width=2, line_dash="solid", label=dict(text=f"Target (${target_val:.2f})", textposition="top right", font=dict(color="#00e5ff")))
-                fig.add_hline(y=entry_val, line_color="#2196F3", line_width=2, line_dash="solid", label=dict(text=f"Entry (${entry_val:.2f})", textposition="top right", font=dict(color="#2196F3")))
-                fig.add_hline(y=stop_val, line_color="#ff9800", line_width=2, line_dash="dash", label=dict(text=f"Stop (${stop_val:.2f})", textposition="bottom right", font=dict(color="#ff9800")))
+                fig.add_hline(y=target_val, line_color="#00e5ff", line_width=2, line_dash="solid", label=dict(text=f"Target (${target_val:.2f})", textposition="top left", font=dict(color="#00e5ff")))
+                fig.add_hline(y=entry_val, line_color="#2196F3", line_width=2, line_dash="solid", label=dict(text=f"Entry (${entry_val:.2f})", textposition="top left", font=dict(color="#2196F3")))
+                fig.add_hline(y=stop_val, line_color="#ff9800", line_width=2, line_dash="dash", label=dict(text=f"Stop (${stop_val:.2f})", textposition="bottom left", font=dict(color="#ff9800")))
                 
                 fig.update_layout(
                     title=f"{ticker_input} Technical Matrix",
