@@ -60,14 +60,13 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS & HEADER SECTOR ---
+# --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS ---
 def scrape_finviz_fallback_data(ticker):
     """
     Scrapes Finviz to extract fundamental valuation metrics (P/E, Forward P/E, PEG)
-    and targets the top-left quote header region to extract Sector and Industry.
+    when primary financial data pipelines return missing structures.
     """
     fallback = {
-        "sector": "N/A",
         "trailing_pe": "N/A",
         "forward_pe": "N/A",
         "peg_ratio": "N/A"
@@ -82,35 +81,7 @@ def scrape_finviz_fallback_data(ticker):
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 1. Target the top-left header zone containing Sector • Industry
-        # Finviz wraps the top-left summary fields in a link layout pool or typography blocks.
-        # We can scan for a text block containing the bullet separator '•' in links near the title info.
-        header_links = soup.find_all("a", class_="tab-link")
-        parsed_sector_components = []
-        
-        for link in header_links:
-            href_attr = link.get("href", "")
-            # Finviz group classification search layout links contain 'screener.ashx?v=111&f=sec_' or 'ind_'
-            if "screener.ashx?v=111" in href_attr and ("f=sec_" in href_attr or "f=ind_" in href_attr):
-                txt = link.text.strip()
-                if txt and txt not in parsed_sector_components:
-                    parsed_sector_components.append(txt)
-                    
-        if parsed_sector_components:
-            # Combine components (e.g., ['Technology', 'Semiconductors'] -> 'Technology - Semiconductors')
-            fallback["sector"] = " - ".join(parsed_sector_components)
-        else:
-            # Multi-strategy search backup: parse direct text lookups for the "•" sequence
-            all_text_nodes = soup.find_all(text=True)
-            for node in all_text_nodes:
-                if "•" in node:
-                    parts = [p.strip() for p in node.split("•") if p.strip()]
-                    # Ensure it looks like a valid sector block instead of numbers or time strings
-                    if len(parts) >= 2 and not any(char.isdigit() for char in parts[0]):
-                        fallback["sector"] = " - ".join(parts)
-                        break
-        
-        # 2. Extract fundamental ratio values from the main metrics layout snapshot table
+        # Extract fundamental ratio values from the main metrics layout snapshot table
         snapshot_table = soup.find("table", class_="snapshot-table2")
         if snapshot_table:
             cells = snapshot_table.find_all("td")
@@ -132,11 +103,11 @@ def scrape_finviz_fallback_data(ticker):
 # --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT EARNINGS & TARGETS ---
 def scrape_marketbeat_fallback_data(ticker):
     """
-    Scrapes MarketBeat to find fallback metrics (Sector, PE, Earnings Dates, MATP)
+    Scrapes MarketBeat to find fallback metrics (PE, Earnings Dates, MATP)
     when Yahoo Finance returns empty dicts or rate limits the system.
     """
     fallback = {
-        "sector": "N/A", "trailing_pe": "N/A", 
+        "trailing_pe": "N/A", 
         "past_earnings_date": None, "next_earnings_date": None,
         "post_earnings_median_matp": None
     }
@@ -153,18 +124,13 @@ def scrape_marketbeat_fallback_data(ticker):
             
         soup = BeautifulSoup(response.text, 'html.parser')
         text_content = soup.get_text()
-        
-        # 1. Scrape Sector metadata out of body patterns
-        sector_match = re.search(r'is a\s+([^,.]+)\s+company', text_content, re.IGNORECASE)
-        if sector_match:
-            fallback["sector"] = sector_match.group(1).strip()
             
-        # 2. Extract P/E Ratio patterns from summary text blocks
+        # Extract P/E Ratio patterns from summary text blocks
         pe_match = re.search(r'P/E\s+ratio\s+of\s+(\d+(?:\.\d+)?)', text_content, re.IGNORECASE)
         if pe_match:
             fallback["trailing_pe"] = float(pe_match.group(1))
 
-        # 3. Process the Brokerage History Table to extract timelines and MATP targets
+        # Process the Brokerage History Table to extract timelines and MATP targets
         history_table = None
         for table in soup.find_all("table"):
             first_row = table.find("tr")
@@ -338,18 +304,14 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            # Run background multi-channel fallback engines
+            # Run background processing fallback metrics
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
-            # Resolve Sector/Industry using corrected top-left header scraper priority
+            # EXCLUSIVE: Resolve Sector/Industry data entirely from yFinance info dictionary maps
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
             detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
-            
-            if detailed_sector_str == "N/A" or not info:
-                # Prioritize Finviz parsed header text block over generic site strings
-                detailed_sector_str = finviz_data["sector"] if finviz_data["sector"] != "N/A" else mb_data["sector"]
                 
             # Resolve Trailing P/E
             trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
