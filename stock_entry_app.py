@@ -60,7 +60,7 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- SCRAPER FALLBACK ENGINE FOR METADATA AND EARNINGS (From v1) ---
+# --- SCRAPER FALLBACK ENGINE FOR METADATA AND EARNINGS ---
 def scrape_marketbeat_fallback_data(ticker):
     """
     Scrapes MarketBeat to find fallback metrics (Sector, PE, Earnings Dates)
@@ -139,7 +139,6 @@ def scrape_marketbeat_fallback_data(ticker):
                     if numeric_match:
                         post_earnings_targets.append(float(numeric_match.group(0)))
             
-            # Map out historical and upcoming earnings dates based on clustered timelines
             if scraped_dates:
                 today = datetime.now(timezone.utc).date()
                 pasts = [d for d in scraped_dates if d <= today]
@@ -172,7 +171,6 @@ def get_earnings_profile(cached_calendar, cached_financials, fallback_data):
     pst_dt = None
     nxt_dt = None
     
-    # 1. Try extracting dates from Yahoo Calendar
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
@@ -185,7 +183,6 @@ def get_earnings_profile(cached_calendar, cached_financials, fallback_data):
                 if pasts: pst_dt = pasts[-1]
     except Exception: pass
 
-    # 2. Scraper Fallback if Yahoo fails
     if not pst_dt and fallback_data["past_earnings_date"]:
         pst_dt = fallback_data["past_earnings_date"]
     if not nxt_dt and fallback_data["next_earnings_date"]:
@@ -201,7 +198,6 @@ def get_earnings_profile(cached_calendar, cached_financials, fallback_data):
         profile["next_days_val"] = (nxt_dt - today_date).days
         profile["next_days"] = f"{profile['next_days_val']}d away" if profile['next_days_val'] > 0 else "Today"
 
-    # 3. Financial Statements Trend Check
     try:
         q_income = cached_financials
         if q_income is not None and not q_income.empty and "Net Income" in q_income.index:
@@ -309,16 +305,15 @@ if ticker_input:
             fwd_pe_styled = style_metric_val(forward_pe, 30.0)
             peg_styled = style_metric_val(peg_ratio, 2.0, is_peg=True)
             
-            def style_earnings_date(date_str, days_val, is_future=False):
+            def style_earnings_date(date_str, label, days_val):
                 if date_str == "N/A" or days_val is None:
                     return f"`{date_str}`"
-                label = earn["next_days"] if is_future else earn["past_elapsed"]
                 if abs(days_val) <= 7:
                     return f'<span style="color:#ff5252; font-weight:bold;">{date_str} ({label})</span>'
                 return f'`{date_str}` ({label})'
 
-            last_earn_styled = style_earnings_date(earn["past_date"], earn["past_days_val"], is_future=False)
-            next_earn_styled = style_earnings_date(earn["next_date"], earn["next_days_val"], is_future=True)
+            last_earn_styled = style_earnings_date(earn["past_date"], earn["past_elapsed"], earn["past_days_val"])
+            next_earn_styled = style_earnings_date(earn["next_date"], earn["next_days"], earn["next_days_val"])
 
             # Formulate layout columns
             workspace_left, workspace_right = st.columns([1, 1.2])
@@ -417,7 +412,7 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
-                # Plotly trace arrays mapped into interactive legend container
+                # Plotly scatter arrays clean-mapped entirely to the interactive plot legend key box
                 fig.add_trace(go.Scatter(
                     x=[chart_df.index.min(), chart_df.index.max()],
                     y=[target_val, target_val],
