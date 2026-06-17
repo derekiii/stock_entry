@@ -60,23 +60,18 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- CORE MATH & ENGINE DATA FUNCTIONS ---
-def get_last_earnings_date_yf(ticker_symbol, cached_calendar):
-    try:
-        if cached_calendar and "Earnings Date" in cached_calendar:
-            dates = cached_calendar["Earnings Date"]
-            if isinstance(dates, list) and len(dates) > 0:
-                return dates[0] if not isinstance(dates[0], datetime) else dates[0].date()
-            elif isinstance(dates, datetime):
-                return dates.date()
-    except Exception: pass
-    return None
-
-def calculate_post_earnings_median_matp(ticker, cached_calendar, default_target_mean, current_price):
-    last_earnings_date = get_last_earnings_date_yf(ticker, cached_calendar)
-    if not last_earnings_date:
-        last_earnings_date = datetime.now(timezone.utc).date() - timedelta(days=14)
-        
+# --- SCRAPER FALLBACK ENGINE FOR METADATA AND EARNINGS (From v1) ---
+def scrape_marketbeat_fallback_data(ticker):
+    """
+    Scrapes MarketBeat to find fallback metrics (Sector, PE, Earnings Dates)
+    when Yahoo Finance returns empty dicts or rate limits the system.
+    """
+    fallback = {
+        "sector": "N/A", "trailing_pe": "N/A", 
+        "past_earnings_date": None, "next_earnings_date": None,
+        "post_earnings_median_matp": None
+    }
+    
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
     try:
@@ -84,10 +79,23 @@ def calculate_post_earnings_median_matp(ticker, cached_calendar, default_target_
         if response.status_code != 200:
             alt_url = f"https://www.marketbeat.com/stocks/NASDAQ/{ticker}/forecast/"
             response = scraper.get(alt_url, timeout=10)
-        if response.status_code != 200: 
-            return float(default_target_mean or current_price)
+        if response.status_code != 200:
+            return fallback
             
         soup = BeautifulSoup(response.text, 'html.parser')
+        text_content = soup.get_text()
+        
+        # 1. Scrape Sector metadata out of body patterns
+        sector_match = re.search(r'is a\s+([^,.]+)\s+company', text_content, re.IGNORECASE)
+        if sector_match:
+            fallback["sector"] = sector_match.group(1).strip()
+            
+        # 2. Extract P/E Ratio patterns from summary text blocks
+        pe_match = re.search(r'P/E\s+ratio\s+of\s+(\d+(?:\.\d+)?)', text_content, re.IGNORECASE)
+        if pe_match:
+            fallback["trailing_pe"] = float(pe_match.group(1))
+
+        # 3. Process the Brokerage History Table to extract dates and MATP targets
         history_table = None
         for table in soup.find_all("table"):
             first_row = table.find("tr")
@@ -96,42 +104,63 @@ def calculate_post_earnings_median_matp(ticker, cached_calendar, default_target_
                 if any("date" in h for h in header_cells) and any("brokerage" in h for h in header_cells):
                     history_table = table
                     break
-        if not history_table: return float(default_target_mean or current_price)
-            
-        header_cells = [cell.text.lower().strip() for cell in history_table.find("tr").find_all(["th", "td"])]
-        date_idx = next((i for i, h in enumerate(header_cells) if "date" in h), 0)
-        target_idx = next((i for i, h in enumerate(header_cells) if "target" in h), 3)
-        
-        post_earnings_targets = []
-        for row in history_table.find_all("tr"):
-            cols = row.find_all(["td", "th"])
-            if len(cols) <= max(date_idx, target_idx): continue
-            raw_date_str = cols[date_idx].text.strip()
-            raw_target_str = cols[target_idx].text.strip()
-            if "date" in raw_date_str.lower() or "brokerage" in raw_date_str.lower(): continue
-                
-            cleaned_date_str = re.sub(r'^[A-Za-z]+,\s+', '', raw_date_str)
-            cleaned_date_str = re.sub(r'\s+', ' ', cleaned_date_str).replace(",", "").replace(".", "").strip()
-            
-            row_date = None
-            for fmt in ("%m/%d/%Y", "%b %d %Y", "%B %d %Y", "%m/%d/%y"):
-                try:
-                    row_date = datetime.strptime(cleaned_date_str, fmt).date()
-                    break
-                except ValueError: continue
-
-            if row_date and row_date >= last_earnings_date:
-                final_target_segment = raw_target_str.split("➝")[-1].strip() if "➝" in raw_target_str else raw_target_str
-                numeric_match = re.search(r'\d+(?:\.\d+)?', final_target_segment.replace(",", ""))
-                if numeric_match:
-                    post_earnings_targets.append(float(numeric_match.group(0)))
                     
-        if post_earnings_targets:
-            return statistics.median(post_earnings_targets)
+        if history_table:
+            header_cells = [cell.text.lower().strip() for cell in history_table.find("tr").find_all(["th", "td"])]
+            date_idx = next((i for i, h in enumerate(header_cells) if "date" in h), 0)
+            target_idx = next((i for i, h in enumerate(header_cells) if "target" in h), 3)
+            
+            scraped_dates = []
+            post_earnings_targets = []
+            
+            for row in history_table.find_all("tr"):
+                cols = row.find_all(["td", "th"])
+                if len(cols) <= max(date_idx, target_idx): continue
+                raw_date_str = cols[date_idx].text.strip()
+                raw_target_str = cols[target_idx].text.strip()
+                if "date" in raw_date_str.lower() or "brokerage" in raw_date_str.lower(): continue
+                    
+                cleaned_date_str = re.sub(r'^[A-Za-z]+,\s+', '', raw_date_str)
+                cleaned_date_str = re.sub(r'\s+', ' ', cleaned_date_str).replace(",", "").replace(".", "").strip()
+                
+                row_date = None
+                for fmt in ("%m/%d/%Y", "%b %d %Y", "%B %d %Y", "%m/%d/%y"):
+                    try:
+                        row_date = datetime.strptime(cleaned_date_str, fmt).date()
+                        break
+                    except ValueError: continue
+                
+                if row_date:
+                    scraped_dates.append(row_date)
+                    
+                    # Accumulate for MATP median parsing
+                    final_target_segment = raw_target_str.split("➝")[-1].strip() if "➝" in raw_target_str else raw_target_str
+                    numeric_match = re.search(r'\d+(?:\.\d+)?', final_target_segment.replace(",", ""))
+                    if numeric_match:
+                        post_earnings_targets.append(float(numeric_match.group(0)))
+            
+            # Map out historical and upcoming earnings dates based on clustered timelines
+            if scraped_dates:
+                today = datetime.now(timezone.utc).date()
+                pasts = [d for d in scraped_dates if d <= today]
+                futures = [d for d in scraped_dates if d > today]
+                
+                if pasts:
+                    fallback["past_earnings_date"] = max(pasts)
+                if futures:
+                    fallback["next_earnings_date"] = min(futures)
+                else:
+                    if fallback["past_earnings_date"]:
+                        fallback["next_earnings_date"] = fallback["past_earnings_date"] + timedelta(days=91)
+            
+            if post_earnings_targets:
+                fallback["post_earnings_median_matp"] = statistics.median(post_earnings_targets)
+                
     except Exception: pass
-    return float(default_target_mean or current_price)
+    return fallback
 
-def get_earnings_profile(cached_calendar, cached_financials):
+# --- PROFILE MATRICES GENERATORS ---
+def get_earnings_profile(cached_calendar, cached_financials, fallback_data):
     now = datetime.now(timezone.utc)
     today_date = now.date()  
     profile = {
@@ -140,29 +169,39 @@ def get_earnings_profile(cached_calendar, cached_financials):
         "trend_str": "", "is_3q_uptrend": False
     }
 
+    pst_dt = None
+    nxt_dt = None
+    
+    # 1. Try extracting dates from Yahoo Calendar
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
                 parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
                 parsed_dates.sort()
-                
                 futures = [d for d in parsed_dates if d >= today_date]
                 pasts = [d for d in parsed_dates if d < today_date]
-                
-                if futures:
-                    nxt = futures[0]
-                    profile["next_date"] = nxt.strftime("%b %d, %Y")
-                    profile["next_days_val"] = (nxt - today_date).days
-                    profile["next_days"] = f"{profile['next_days_val']}d away" if profile["next_days_val"] > 0 else "Today"
-                    
-                if pasts:
-                    pst = pasts[-1]
-                    profile["past_date"] = pst.strftime("%b %d, %Y")
-                    profile["past_days_val"] = (today_date - pst).days
-                    profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
+                if futures: nxt_dt = futures[0]
+                if pasts: pst_dt = pasts[-1]
     except Exception: pass
 
+    # 2. Scraper Fallback if Yahoo fails
+    if not pst_dt and fallback_data["past_earnings_date"]:
+        pst_dt = fallback_data["past_earnings_date"]
+    if not nxt_dt and fallback_data["next_earnings_date"]:
+        nxt_dt = fallback_data["next_earnings_date"]
+
+    if pst_dt:
+        profile["past_date"] = pst_dt.strftime("%b %d, %Y")
+        profile["past_days_val"] = (today_date - pst_dt).days
+        profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
+        
+    if nxt_dt:
+        profile["next_date"] = nxt_dt.strftime("%b %d, %Y")
+        profile["next_days_val"] = (nxt_dt - today_date).days
+        profile["next_days"] = f"{profile['next_days_val']}d away" if profile['next_days_val'] > 0 else "Today"
+
+    # 3. Financial Statements Trend Check
     try:
         q_income = cached_financials
         if q_income is not None and not q_income.empty and "Net Income" in q_income.index:
@@ -178,13 +217,13 @@ def get_earnings_profile(cached_calendar, cached_financials):
             if len(pct_values) >= 3 and all(p > 0 for p in pct_values):
                 profile["is_3q_uptrend"] = True
     except Exception: pass
+    
     return profile
 
 
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
 
-# Inject Dark Mode Styling
 st.markdown("""
     <style>
         .stApp { background-color: #121212; color: #ffffff; }
@@ -235,12 +274,28 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
-            forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
-            peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
+            # Fire up Scraper Fallbacks ahead of UI mapping
+            fallback_data = scrape_marketbeat_fallback_data(ticker_input)
+            
+            # Resolve Sector/Industry data
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
+            detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
+            if detailed_sector_str == "N/A" or not info:
+                detailed_sector_str = fallback_data["sector"]
+                
+            # Resolve Valuation Ratios
+            trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
+            if trailing_pe == "N/A": 
+                trailing_pe = fallback_data["trailing_pe"]
+                
+            forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
+            peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
             target_mean_price = info.get("targetMeanPrice") if info else None
+            
+            # Resolve MATP Calculations & Earnings Profile
+            scraped_matp = fallback_data["post_earnings_median_matp"] or target_mean_price or current_price
+            earn = get_earnings_profile(calendar, quarterly_income, fallback_data)
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)):
@@ -253,11 +308,6 @@ if ticker_input:
             pe_styled = style_metric_val(trailing_pe, 30.0)
             fwd_pe_styled = style_metric_val(forward_pe, 30.0)
             peg_styled = style_metric_val(peg_ratio, 2.0, is_peg=True)
-            
-            detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
-            
-            scraped_matp = calculate_post_earnings_median_matp(ticker_input, calendar, target_mean_price, current_price)
-            earn = get_earnings_profile(calendar, quarterly_income)
             
             def style_earnings_date(date_str, days_val, is_future=False):
                 if date_str == "N/A" or days_val is None:
@@ -367,7 +417,7 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
-                # Strategic Reference Lines integrated into the Interactive Legend Box
+                # Plotly trace arrays mapped into interactive legend container
                 fig.add_trace(go.Scatter(
                     x=[chart_df.index.min(), chart_df.index.max()],
                     y=[target_val, target_val],
