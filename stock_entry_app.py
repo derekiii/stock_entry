@@ -17,7 +17,7 @@ OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 @st.cache_data(ttl=300)  # Caches results for 5 minutes (300 seconds)
 def fetch_stock_data_cached(ticker_symbol):
     """
-    Fetches historical data, calendar information, ticker info stats, and news
+    Fetches historical data, calendar information, ticker info stats, and financials
     in a single cached block to protect the cloud IP from Yahoo rate limits.
     """
     ticker = yf.Ticker(ticker_symbol)
@@ -37,7 +37,7 @@ def fetch_stock_data_cached(ticker_symbol):
     try:
         info_dict = ticker.info
     except Exception:
-        pass # Fallback to empty if .info hits a rate limit block
+        pass
         
     # 3. Pull Earnings Calendar Safely
     calendar_dict = {}
@@ -46,10 +46,10 @@ def fetch_stock_data_cached(ticker_symbol):
     except Exception:
         pass
 
-    # 4. Pull Streaming News Safely
-    news_list = []
+    # 4. Pull Primary Earnings Dates Directly as fallback
+    earnings_dates_df = None
     try:
-        news_list = ticker.news
+        earnings_dates_df = ticker.get_earnings_dates(limit=20)
     except Exception:
         pass
 
@@ -64,14 +64,21 @@ def fetch_stock_data_cached(ticker_symbol):
         "df": full_df,
         "info": info_dict,
         "calendar": calendar_dict,
-        "news": news_list,
+        "earnings_dates_df": earnings_dates_df,
         "quarterly_income": quarterly_income
     }, None
 
 # --- CORE MATH & ENGINE DATA FUNCTIONS ---
-def get_last_earnings_date_yf(ticker_symbol, cached_calendar):
+def get_last_earnings_date_yf(ticker_symbol, cached_calendar, cached_df):
     try:
-        # Fallback Method: Use pre-cached calendar data safely
+        # Priority Fallback 1: Use direct historical data table if pulled successfully
+        if cached_df is not None and not cached_df.empty:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            past_earnings = cached_df[cached_df.index <= now_utc]
+            if not past_earnings.empty:
+                return past_earnings.index.max().date()
+
+        # Priority Fallback 2: Use pre-cached calendar data safely
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
@@ -81,8 +88,8 @@ def get_last_earnings_date_yf(ticker_symbol, cached_calendar):
     except Exception: pass
     return None
 
-def calculate_post_earnings_median_matp(ticker, cached_calendar, default_target_mean, current_price):
-    last_earnings_date = get_last_earnings_date_yf(ticker, cached_calendar)
+def calculate_post_earnings_median_matp(ticker, cached_calendar, cached_df, default_target_mean, current_price):
+    last_earnings_date = get_last_earnings_date_yf(ticker, cached_calendar, cached_df)
     if not last_earnings_date:
         last_earnings_date = datetime.now(timezone.utc).date() - timedelta(days=14)
         
@@ -140,7 +147,7 @@ def calculate_post_earnings_median_matp(ticker, cached_calendar, default_target_
     except Exception: pass
     return float(default_target_mean or current_price)
 
-def get_earnings_profile(cached_calendar, cached_financials):
+def get_earnings_profile(cached_calendar, cached_df, cached_financials):
     now = datetime.now(timezone.utc)
     today_date = now.date()  
     profile = {
@@ -149,8 +156,32 @@ def get_earnings_profile(cached_calendar, cached_financials):
         "trend_str": "", "is_3q_uptrend": False
     }
 
+    # Method 1: Process Direct Earnings Dataframe if Available
     try:
-        if cached_calendar and "Earnings Date" in cached_calendar:
+        if cached_df is not None and not cached_df.empty:
+            df_copy = cached_df.copy()
+            df_copy.index = df_copy.index.tz_localize(None)
+            today_datetime = datetime.combine(today_date, datetime.min.time())
+            
+            past_earnings = df_copy[df_copy.index <= today_datetime]
+            future_earnings = df_copy[df_copy.index > today_datetime]
+            
+            if not future_earnings.empty:
+                next_event = future_earnings.index.min().date()
+                profile["next_date"] = next_event.strftime("%b %d, %Y")
+                profile["next_days_val"] = (next_event - today_date).days
+                profile["next_days"] = "Today" if profile["next_days_val"] == 0 else f"{profile['next_days_val']}d away"
+                
+            if not past_earnings.empty:
+                past_event = past_earnings.index.max().date()
+                profile["past_date"] = past_event.strftime("%b %d, %Y")
+                profile["past_days_val"] = (today_date - past_event).days
+                profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
+    except Exception: pass
+
+    # Method 2: Fallback onto Calendar Dictionary if Method 1 returned incomplete values
+    try:
+        if (profile["next_date"] == "N/A" or profile["past_date"] == "N/A") and cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
                 parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
@@ -159,13 +190,13 @@ def get_earnings_profile(cached_calendar, cached_financials):
                 futures = [d for d in parsed_dates if d >= today_date]
                 pasts = [d for d in parsed_dates if d < today_date]
                 
-                if futures:
+                if futures and profile["next_date"] == "N/A":
                     nxt = futures[0]
                     profile["next_date"] = nxt.strftime("%b %d, %Y")
                     profile["next_days_val"] = (nxt - today_date).days
                     profile["next_days"] = f"{profile['next_days_val']}d away" if profile["next_days_val"] > 0 else "Today"
                     
-                if pasts:
+                if pasts and profile["past_date"] == "N/A":
                     pst = pasts[-1]
                     profile["past_date"] = pst.strftime("%b %d, %Y")
                     profile["past_days_val"] = (today_date - pst).days
@@ -193,7 +224,6 @@ def get_earnings_profile(cached_calendar, cached_financials):
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
 
-# Inject Dark Mode Styling
 st.markdown("""
     <style>
         .stApp { background-color: #121212; color: #ffffff; }
@@ -212,7 +242,6 @@ with st.sidebar:
 
 if ticker_input:
     with st.spinner(f"Analyzing {ticker_input} profiles safely from cache pool..."):
-        # Invoke the cached core data downloader block
         dataset, error_msg = fetch_stock_data_cached(ticker_input)
         
         if error_msg:
@@ -227,7 +256,7 @@ if ticker_input:
             full_df = dataset["df"]
             info = dataset["info"]
             calendar = dataset["calendar"]
-            news_list = dataset["news"]
+            earnings_dates_df = dataset["earnings_dates_df"]
             quarterly_income = dataset["quarterly_income"]
             
             chart_df = full_df.tail(63).copy()
@@ -236,7 +265,6 @@ if ticker_input:
             ema50 = float(full_df["EMA50"].iloc[-1])
             ema200 = float(full_df["EMA200"].iloc[-1])
             
-            # True Range (TR) Matrix
             tr = pd.concat([
                 full_df["High"] - full_df["Low"], 
                 (full_df["High"] - full_df["Close"].shift()).abs(), 
@@ -246,7 +274,6 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            # Handle empty .info dictionary rate limit gracefully
             trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
             forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
             peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
@@ -254,7 +281,6 @@ if ticker_input:
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
             target_mean_price = info.get("targetMeanPrice") if info else None
             
-            # Formulate dynamic evaluation tags for P/E & PEG color highlights based on thresholds
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)):
                     return f"`{val}`"
@@ -269,10 +295,9 @@ if ticker_input:
             
             detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
             
-            scraped_matp = calculate_post_earnings_median_matp(ticker_input, calendar, target_mean_price, current_price)
-            earn = get_earnings_profile(calendar, quarterly_income)
+            scraped_matp = calculate_post_earnings_median_matp(ticker_input, calendar, earnings_dates_df, target_mean_price, current_price)
+            earn = get_earnings_profile(calendar, earnings_dates_df, quarterly_income)
             
-            # Color coding style for earnings dates (Red if within 7 days)
             def style_earnings_date(date_str, days_val, is_future=False):
                 if date_str == "N/A" or days_val is None:
                     return f"`{date_str}`"
@@ -284,13 +309,10 @@ if ticker_input:
             last_earn_styled = style_earnings_date(earn["past_date"], earn["past_days_val"], is_future=False)
             next_earn_styled = style_earnings_date(earn["next_date"], earn["next_days_val"], is_future=True)
 
-            # Formulate layout columns
             workspace_left, workspace_right = st.columns([1, 1.2])
             
             with workspace_left:
                 st.subheader("📊 Core Market Analysis Profile")
-                
-                # Single metric layout card
                 st.metric("Current Price", f"${current_price:.2f}")
                 
                 st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
@@ -307,49 +329,6 @@ if ticker_input:
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
                 st.markdown(f"**Quarterly Income Health:** {qh_text} {earn['trend_str']}")
-                
-                # --- US MACRO & TICKER NEWS TERMINAL ---
-                st.markdown("---")
-                st.subheader("🌐 Global Macro & Sentiment Engine")
-                
-                st.markdown("**Macro Sentiment Summary:** 🔴 **UNSETTLED / CAUTIOUS BEARISH**")
-                st.caption("Markets are dealing with persistent ~3.0% sticky inflation risks and macroeconomic uncertainty. Underlying consumer headwinds remain high.")
-                
-                def style_status_badge(text, is_good=True):
-                    color = "#00e676" if is_good else "#ff5252"
-                    return f'<span style="background-color:{color}; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">{text}</span>'
-                
-                macro_data = [
-                    {"metric": "Core CPI Inflation (3.0% annualized)", "badge": style_status_badge("BAD / STICKY", is_good=False), "desc": "Driven by core service expansion and structural energy friction."},
-                    {"metric": "Federal Reserve Rate Strategy", "badge": style_status_badge("HAWKISH / PAUSE", is_good=False), "desc": "Rates remain structurally restrictive to cap trailing cost spikes."},
-                    {"metric": "Atlanta Fed GDPNow Growth Forecast", "badge": style_status_badge("GOOD / STABLE", is_good=True), "desc": "Running stable at an estimated ~1.6% tracking velocity."},
-                    {"metric": "U-Michigan Consumer Sentiment Index", "badge": style_status_badge("BAD / HISTORIC LOW", is_good=False), "desc": "Bounced up slightly to 48.9, but continues to be highly weighed down by raw living costs."}
-                ]
-                
-                for item in macro_data:
-                    st.markdown(f"• **{item['metric']}** — {item['badge']} *{item['desc']}*", unsafe_allow_html=True)
-                    
-                st.markdown("---")
-                st.subheader(f"📰 Latest Market News Feed: {ticker_input}")
-                
-                if news_list:
-                    for item in news_list[:4]:
-                        title = item.get("title", "No Title")
-                        link = item.get("link", "#")
-                        publisher = item.get("publisher", "Market News")
-                        
-                        title_lower = title.lower()
-                        if any(w in title_lower for w in ["gain", "surge", "growth", "buy", "beat", "higher", "bull"]):
-                            badge_str = style_status_badge("BULLISH", is_good=True)
-                        elif any(w in title_lower for w in ["drop", "fall", "risk", "sell", "miss", "lower", "bear", "ban"]):
-                            badge_str = style_status_badge("BEARISH", is_good=False)
-                        else:
-                            badge_str = '<span style="background-color:#757575; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">NEUTRAL</span>'
-                            
-                        st.markdown(f"🔹 **[{title}]({link})** ({publisher})")
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;Market Sentiment: {badge_str}", unsafe_allow_html=True)
-                else:
-                    st.info("No current media press coverage records returned (Rate limits applied by Provider).")
                 
                 st.markdown("---")
                 st.subheader("⚙️ Interactive Formula Adjustments")
@@ -423,6 +402,7 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
+                # Snaps horizontal line annotations neatly onto the left side margin edge 
                 fig.add_hline(y=target_val, line_color="#00e5ff", line_width=2, line_dash="solid", label=dict(text=f"Target (${target_val:.2f})", textposition="top left", font=dict(color="#00e5ff")))
                 fig.add_hline(y=entry_val, line_color="#2196F3", line_width=2, line_dash="solid", label=dict(text=f"Entry (${entry_val:.2f})", textposition="top left", font=dict(color="#2196F3")))
                 fig.add_hline(y=stop_val, line_color="#ff9800", line_width=2, line_dash="dash", label=dict(text=f"Stop (${stop_val:.2f})", textposition="bottom left", font=dict(color="#ff9800")))
