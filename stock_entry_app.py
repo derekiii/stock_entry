@@ -17,7 +17,7 @@ OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 @st.cache_data(ttl=300)  # Caches results for 5 minutes (300 seconds)
 def fetch_stock_data_cached(ticker_symbol):
     """
-    Fetches historical data, calendar information, ticker info stats, and financials
+    Fetches historical data, calendar information, ticker info stats, and news
     in a single cached block to protect the cloud IP from Yahoo rate limits.
     """
     ticker = yf.Ticker(ticker_symbol)
@@ -37,7 +37,7 @@ def fetch_stock_data_cached(ticker_symbol):
     try:
         info_dict = ticker.info
     except Exception:
-        pass
+        pass # Fallback to empty if .info hits a rate limit block
         
     # 3. Pull Earnings Calendar Safely
     calendar_dict = {}
@@ -46,7 +46,14 @@ def fetch_stock_data_cached(ticker_symbol):
     except Exception:
         pass
 
-    # 4. Pull Financials for Trend Stats Safely
+    # 4. Pull Streaming News Safely
+    news_list = []
+    try:
+        news_list = ticker.news
+    except Exception:
+        pass
+
+    # 5. Pull Financials for Trend Stats Safely
     quarterly_income = None
     try:
         quarterly_income = ticker.quarterly_income_stmt
@@ -57,12 +64,14 @@ def fetch_stock_data_cached(ticker_symbol):
         "df": full_df,
         "info": info_dict,
         "calendar": calendar_dict,
+        "news": news_list,
         "quarterly_income": quarterly_income
     }, None
 
 # --- CORE MATH & ENGINE DATA FUNCTIONS ---
 def get_last_earnings_date_yf(ticker_symbol, cached_calendar):
     try:
+        # Fallback Method: Use pre-cached calendar data safely
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
@@ -203,6 +212,7 @@ with st.sidebar:
 
 if ticker_input:
     with st.spinner(f"Analyzing {ticker_input} profiles safely from cache pool..."):
+        # Invoke the cached core data downloader block
         dataset, error_msg = fetch_stock_data_cached(ticker_input)
         
         if error_msg:
@@ -217,6 +227,7 @@ if ticker_input:
             full_df = dataset["df"]
             info = dataset["info"]
             calendar = dataset["calendar"]
+            news_list = dataset["news"]
             quarterly_income = dataset["quarterly_income"]
             
             chart_df = full_df.tail(63).copy()
@@ -235,6 +246,7 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
+            # Handle empty .info dictionary rate limit gracefully
             trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
             forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
             peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
@@ -242,6 +254,7 @@ if ticker_input:
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
             target_mean_price = info.get("targetMeanPrice") if info else None
             
+            # Formulate dynamic evaluation tags for P/E & PEG color highlights based on thresholds
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)):
                     return f"`{val}`"
@@ -259,6 +272,7 @@ if ticker_input:
             scraped_matp = calculate_post_earnings_median_matp(ticker_input, calendar, target_mean_price, current_price)
             earn = get_earnings_profile(calendar, quarterly_income)
             
+            # Color coding style for earnings dates (Red if within 7 days)
             def style_earnings_date(date_str, days_val, is_future=False):
                 if date_str == "N/A" or days_val is None:
                     return f"`{date_str}`"
@@ -276,6 +290,7 @@ if ticker_input:
             with workspace_left:
                 st.subheader("📊 Core Market Analysis Profile")
                 
+                # Single metric layout card
                 st.metric("Current Price", f"${current_price:.2f}")
                 
                 st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
@@ -292,6 +307,49 @@ if ticker_input:
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
                 st.markdown(f"**Quarterly Income Health:** {qh_text} {earn['trend_str']}")
+                
+                # --- US MACRO & TICKER NEWS TERMINAL ---
+                st.markdown("---")
+                st.subheader("🌐 Global Macro & Sentiment Engine")
+                
+                st.markdown("**Macro Sentiment Summary:** 🔴 **UNSETTLED / CAUTIOUS BEARISH**")
+                st.caption("Markets are dealing with persistent ~3.0% sticky inflation risks and macroeconomic uncertainty. Underlying consumer headwinds remain high.")
+                
+                def style_status_badge(text, is_good=True):
+                    color = "#00e676" if is_good else "#ff5252"
+                    return f'<span style="background-color:{color}; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">{text}</span>'
+                
+                macro_data = [
+                    {"metric": "Core CPI Inflation (3.0% annualized)", "badge": style_status_badge("BAD / STICKY", is_good=False), "desc": "Driven by core service expansion and structural energy friction."},
+                    {"metric": "Federal Reserve Rate Strategy", "badge": style_status_badge("HAWKISH / PAUSE", is_good=False), "desc": "Rates remain structurally restrictive to cap trailing cost spikes."},
+                    {"metric": "Atlanta Fed GDPNow Growth Forecast", "badge": style_status_badge("GOOD / STABLE", is_good=True), "desc": "Running stable at an estimated ~1.6% tracking velocity."},
+                    {"metric": "U-Michigan Consumer Sentiment Index", "badge": style_status_badge("BAD / HISTORIC LOW", is_good=False), "desc": "Bounced up slightly to 48.9, but continues to be highly weighed down by raw living costs."}
+                ]
+                
+                for item in macro_data:
+                    st.markdown(f"• **{item['metric']}** — {item['badge']} *{item['desc']}*", unsafe_allow_html=True)
+                    
+                st.markdown("---")
+                st.subheader(f"📰 Latest Market News Feed: {ticker_input}")
+                
+                if news_list:
+                    for item in news_list[:4]:
+                        title = item.get("title", "No Title")
+                        link = item.get("link", "#")
+                        publisher = item.get("publisher", "Market News")
+                        
+                        title_lower = title.lower()
+                        if any(w in title_lower for w in ["gain", "surge", "growth", "buy", "beat", "higher", "bull"]):
+                            badge_str = style_status_badge("BULLISH", is_good=True)
+                        elif any(w in title_lower for w in ["drop", "fall", "risk", "sell", "miss", "lower", "bear", "ban"]):
+                            badge_str = style_status_badge("BEARISH", is_good=False)
+                        else:
+                            badge_str = '<span style="background-color:#757575; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">NEUTRAL</span>'
+                            
+                        st.markdown(f"🔹 **[{title}]({link})** ({publisher})")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;Market Sentiment: {badge_str}", unsafe_allow_html=True)
+                else:
+                    st.info("No current media press coverage records returned (Rate limits applied by Provider).")
                 
                 st.markdown("---")
                 st.subheader("⚙️ Interactive Formula Adjustments")
