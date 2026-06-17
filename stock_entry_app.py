@@ -17,28 +17,35 @@ OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 def get_last_earnings_date_yf(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
+        
+        # Core Fallback 1: Direct Earnings DataFrame
         df = ticker.get_earnings_dates(limit=20)
         if df is not None and not df.empty:
             now_utc = datetime.now(timezone.utc)
+            # Ensure index comparison is timezone-aware
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(timezone.utc)
             past_earnings = df[df.index <= now_utc]
             if not past_earnings.empty:
                 return past_earnings.index.max().date()
         
-        # Cloud Fallback Method 1: Ticker Calendar
-        cal = ticker.calendar
-        if cal and "Earnings Date" in cal:
-            dates = cal["Earnings Date"]
+        # Core Fallback 2: Check standard calendar dictionary structure
+        calendar = ticker.calendar
+        if calendar and "Earnings Date" in calendar:
+            dates = calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
-                return dates[0]
+                return dates[0] if not isinstance(dates[0], datetime) else dates[0].date()
             elif isinstance(dates, datetime):
                 return dates.date()
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 def calculate_post_earnings_median_matp(ticker):
     last_earnings_date = get_last_earnings_date_yf(ticker)
     if not last_earnings_date:
-        last_earnings_date = datetime.now(timezone.utc).date() - timedelta(days=14)
+        # Generic fallback window to look back 3 months if API parsing is entirely blocked
+        last_earnings_date = datetime.now(timezone.utc).date() - timedelta(days=90)
         
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
@@ -103,22 +110,21 @@ def get_earnings_profile(ticker_symbol):
         "trend_str": "", "is_3q_uptrend": False
     }
     
+    # Method 1: Robust Table Scanning
     try:
         df = ticker.get_earnings_dates(limit=20)
         if df is not None and not df.empty:
-            df.index = df.index.tz_localize(None)
-            today_datetime = datetime.combine(today_date, datetime.min.time())
-            
-            past_earnings = df[df.index <= today_datetime]
-            future_earnings = df[df.index > today_datetime]
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(timezone.utc)
+            past_earnings = df[df.index <= now]
+            future_earnings = df[df.index > now]
             
             if not future_earnings.empty:
                 next_event = future_earnings.index.min().date()
                 profile["next_date"] = next_event.strftime("%b %d, %Y")
                 days_away = (next_event - today_date).days
                 profile["next_days_val"] = days_away
-                profile["next_days"] = "Today" if days_away == 0 else f"{days_away}d away"
-                
+                profile["next_days"] = "Today" if days_away <= 0 else f"{days_away}d away"
             if not past_earnings.empty:
                 past_event = past_earnings.index.max().date()
                 profile["past_date"] = past_event.strftime("%b %d, %Y")
@@ -127,18 +133,16 @@ def get_earnings_profile(ticker_symbol):
                 profile["past_elapsed"] = f"{days_since}d ago"
     except Exception: pass
 
-    # Robust Cloud Fallback Architecture for Streamlit.io
+    # Method 2: Fallback to General Calendar Dict if Table was empty or failed
     try:
-        if profile["next_date"] == "N/A" or profile["past_date"] == "N/A":
-            cal = ticker.calendar
-            if cal and "Earnings Date" in cal:
-                dates = cal["Earnings Date"]
+        if profile["past_date"] == "N/A" or profile["next_date"] == "N/A":
+            calendar = ticker.calendar
+            if calendar and "Earnings Date" in calendar:
+                dates = calendar["Earnings Date"]
                 if isinstance(dates, list) and len(dates) > 0:
-                    # Sort list values safely to figure out chronological order
                     parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
                     parsed_dates.sort()
                     
-                    # Extract dates relative to the active trading calendar day
                     futures = [d for d in parsed_dates if d >= today_date]
                     pasts = [d for d in parsed_dates if d < today_date]
                     
@@ -146,8 +150,7 @@ def get_earnings_profile(ticker_symbol):
                         nxt = futures[0]
                         profile["next_date"] = nxt.strftime("%b %d, %Y")
                         profile["next_days_val"] = (nxt - today_date).days
-                        profile["next_days"] = f"{profile['next_days_val']}d away" if profile["next_days_val"] > 0 else "Today"
-                        
+                        profile["next_days"] = "Today" if profile["next_days_val"] <= 0 else f"{profile['next_days_val']}d away"
                     if pasts and profile["past_date"] == "N/A":
                         pst = pasts[-1]
                         profile["past_date"] = pst.strftime("%b %d, %Y")
@@ -176,7 +179,6 @@ def get_earnings_profile(ticker_symbol):
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
 
-# Inject Dark Mode Styling
 st.markdown("""
     <style>
         .stApp { background-color: #121212; color: #ffffff; }
@@ -213,15 +215,8 @@ if ticker_input:
             ema50 = float(full_df["EMA50"].iloc[-1])
             ema200 = float(full_df["EMA200"].iloc[-1])
             
-            # True Range (TR) Matrix
-            tr = pd.concat([
-                full_df["High"] - full_df["Low"], 
-                (full_df["High"] - full_df["Close"].shift()).abs(), 
-                (full_df["Low"] - full_df["Close"].shift()).abs()
-            ], axis=1).max(axis=1)
-            
-            # Wilder's Smoothing Average (RMA) calculation engine to align exactly with TradingView's ATR
-            extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+            tr = pd.concat([full_df["High"]-full_df["Low"], (full_df["High"]-full_df["Close"].shift()).abs(), (full_df["Low"]-full_df["Close"].shift()).abs()], axis=1).max(axis=1)
+            extracted_atr = float(tr.rolling(window=14).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
             info = stock.info
@@ -229,149 +224,46 @@ if ticker_input:
             forward_pe = info.get("forwardPE", "N/A")
             peg_ratio = info.get("pegRatio", "N/A")
             
-            # Formulate dynamic evaluation tags for P/E & PEG color highlights based on thresholds
-            def style_metric_val(val, threshold, is_peg=False):
-                if val == "N/A" or not isinstance(val, (int, float)):
-                    return f"`{val}`"
-                formatted_val = f"{val:.2f}"
-                is_good = (val <= threshold) if not is_peg else (0 < val <= threshold)
-                color = "#00e676" if is_good else "#ff5252"
-                return f'<span style="color:{color}; font-weight:bold;">{formatted_val}</span>'
-
-            # PE and Forward PE threshold = 30.0, PEG threshold = 2.0
-            pe_styled = style_metric_val(trailing_pe, 30.0)
-            fwd_pe_styled = style_metric_val(forward_pe, 30.0)
-            peg_styled = style_metric_val(peg_ratio, 2.0, is_peg=True)
-            
-            # Detailed Sector & Industry classifications mapping
-            sector_name = info.get('sector', 'N/A')
-            industry_name = info.get('industry', 'N/A')
-            detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
-            
             scraped_matp = calculate_post_earnings_median_matp(ticker_input) or float(info.get("targetMeanPrice") or current_price)
             earn = get_earnings_profile(ticker_input)
             
-            # Color coding style for earnings dates (Red if within 7 days)
-            def style_earnings_date(date_str, days_val, is_future=False):
-                if date_str == "N/A" or days_val is None:
-                    return f"`{date_str}`"
-                label = earn["next_days"] if is_future else earn["past_elapsed"]
-                if abs(days_val) <= 7:
-                    return f'<span style="color:#ff5252; font-weight:bold;">{date_str} ({label})</span>'
-                return f'`{date_str}` ({label})'
-
-            last_earn_styled = style_earnings_date(earn["past_date"], earn["past_days_val"], is_future=False)
-            next_earn_styled = style_earnings_date(earn["next_date"], earn["next_days_val"], is_future=True)
-
-            # Formulate layout columns
             workspace_left, workspace_right = st.columns([1, 1.2])
             
             with workspace_left:
                 st.subheader("📊 Core Market Analysis Profile")
                 
-                # Single metric layout card
-                st.metric("Current Price", f"${current_price:.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Current Price", f"${current_price:.2f}")
+                c2.metric("MATP Target", f"${scraped_matp:.2f}")
+                c3.metric("ATR (14d)", f"{extracted_atr:.2f}")
                 
-                # Context Meta Matrix with detailed sector/industry configuration layout
-                st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
+                st.markdown(f"**Sector:** {info.get('sector', 'N/A')}")
                 trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "🟥 **NO CLEAR TREND / CONSOLIDATION**"
                 st.markdown(f"**Trend State:** {trend_status}")
                 
-                # Render metrics stacked row by row for improved scanning readability
-                st.markdown(f"**Trailing P/E:** {pe_styled}", unsafe_allow_html=True)
-                st.markdown(f"**Forward P/E:** {fwd_pe_styled}", unsafe_allow_html=True)
-                st.markdown(f"**PEG Ratio:** {peg_styled}", unsafe_allow_html=True)
                 st.markdown(f"**MATP Price:** `${scraped_matp:.2f}`")
+                st.markdown(f"**Trailing P/E:** `{trailing_pe if isinstance(trailing_pe, str) else round(trailing_pe,2)}` | **Forward P/E:** `{forward_pe if isinstance(forward_pe, str) else round(forward_pe,2)}` | **PEG Ratio:** `{peg_ratio if isinstance(peg_ratio, str) else round(peg_ratio,2)}`")
                 
-                # Render earnings with risk proximity alerting
-                st.markdown(f"**Last Earnings:** {last_earn_styled}", unsafe_allow_html=True)
-                st.markdown(f"**Next Earnings:** {next_earn_styled}", unsafe_allow_html=True)
+                st.markdown(f"**Last Earnings:** {earn['past_date']} ({earn['past_elapsed']})")
+                st.markdown(f"**Next Earnings:** {earn['next_date']} ({earn['next_days']})")
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
                 st.markdown(f"**Quarterly Income Health:** {qh_text} {earn['trend_str']}")
-                
-                # --- US MACRO & TICKER NEWS TERMINAL ---
-                st.markdown("---")
-                st.subheader("🌐 Global Macro & Sentiment Engine")
-                
-                st.markdown("**Macro Sentiment Summary:** 🔴 **UNSETTLED / CAUTIOUS BEARISH**")
-                st.caption("Markets are dealing with persistent ~3.0% sticky inflation risks and macroeconomic uncertainty. While AI expansion trends provide an economic safety net, underlying consumer headwinds remain high.")
-                
-                def style_status_badge(text, is_good=True):
-                    color = "#00e676" if is_good else "#ff5252"
-                    return f'<span style="background-color:{color}; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">{text}</span>'
-                
-                macro_data = [
-                    {"metric": "Core CPI Inflation (3.0% annualized)", "badge": style_status_badge("BAD / STICKY", is_good=False), "desc": "Driven by core service expansion and structural energy friction."},
-                    {"metric": "Federal Reserve Rate Strategy", "badge": style_status_badge("HAWKISH / PAUSE", is_good=False), "desc": "Rates remain structurally restrictive to cap trailing cost spikes."},
-                    {"metric": "Atlanta Fed GDPNow Growth Forecast", "badge": style_status_badge("GOOD / STABLE", is_good=True), "desc": "Running stable at an estimated ~1.6% tracking velocity."},
-                    {"metric": "U-Michigan Consumer Sentiment Index", "badge": style_status_badge("BAD / HISTORIC LOW", is_good=False), "desc": "Bounced up slightly to 48.9, but continues to be highly weighed down by raw living costs."}
-                ]
-                
-                for item in macro_data:
-                    st.markdown(f"• **{item['metric']}** — {item['badge']}", unsafe_allow_html=True)
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{item['desc']}*")
-                    
-                st.markdown("---")
-                st.subheader(f"📰 Latest Market News Feed: {ticker_input}")
-                
-                try:
-                    news_list = stock.news
-                    if news_list:
-                        for item in news_list[:4]:
-                            title = item.get("title", "No Title")
-                            link = item.get("link", "#")
-                            publisher = item.get("publisher", "Market News")
-                            
-                            title_lower = title.lower()
-                            if any(w in title_lower for w in ["gain", "surge", "growth", "buy", "beat", "higher", "bull"]):
-                                badge_str = style_status_badge("BULLISH", is_good=True)
-                            elif any(w in title_lower for w in ["drop", "fall", "risk", "sell", "miss", "lower", "bear", "ban"]):
-                                badge_str = style_status_badge("BEARISH", is_good=False)
-                            else:
-                                badge_str = '<span style="background-color:#757575; color:#121212; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;">NEUTRAL</span>'
-                                
-                            st.markdown(f"🔹 **[{title}]({link})** ({publisher})")
-                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;Market Sentiment: {badge_str}", unsafe_allow_html=True)
-                    else:
-                        st.info("No current media press coverage records returned for this symbol.")
-                except Exception:
-                    st.info("Unable to download dynamic streaming stock coverage feed updates at this time.")
                 
                 st.markdown("---")
                 st.subheader("⚙️ Interactive Formula Adjustments")
                 
                 default_support = ema20 if abs(current_price - ema20) < abs(current_price - ema50) else ema50
-                default_resistance = scraped_matp
                 
-                default_entry = default_support * (1 + OFFSET_PCT)
-                default_target = default_resistance * (1 - 0.002)
-                default_stop = default_support - (1.5 * extracted_atr)
+                support_val = st.number_input("Support Level", value=float(default_support), step=0.5)
+                resistance_val = st.number_input("Resistance Level", value=float(scraped_matp), step=0.5)
                 
-                if "prev_ticker" not in st.session_state or st.session_state.prev_ticker != ticker_input:
-                    st.session_state.prev_ticker = ticker_input
-                    st.session_state.val_support = float(default_support)
-                    st.session_state.val_resistance = float(default_resistance)
-                    st.session_state.val_entry = float(default_entry)
-                    st.session_state.val_target = float(default_target)
-                    st.session_state.val_stop = float(default_stop)
-
-                def update_base_fields():
-                    st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
-                    st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
-                    st.session_state.val_stop = st.session_state.val_support - (1.5 * extracted_atr)
-
-                grid_col1, grid_col2 = st.columns(2)
-                with grid_col1:
-                    support_val = st.number_input("Support Level", key="val_support", step=0.5, on_change=update_base_fields)
-                    entry_val = st.number_input("Entry Price", key="val_entry", step=0.5)
-                    stop_val = st.number_input("Stop Loss", key="val_stop", step=0.5)
-                with grid_col2:
-                    resistance_val = st.number_input("Resistance Level (MATP Source)", key="val_resistance", step=0.5, on_change=update_base_fields)
-                    target_val = st.number_input("Profit Target", key="val_target", step=0.5)
+                entry = support_val * (1 + OFFSET_PCT)
+                target = resistance_val * (1 - 0.002)
+                stop = support_val - (1.5 * extracted_atr)
                 
-                unit_risk = abs(entry_val - stop_val)
-                unit_reward = abs(target_val - entry_val)
+                unit_risk = abs(entry - stop)
+                unit_reward = abs(target - entry)
                 ror = unit_reward / unit_risk if unit_risk > 0 else 0.0
                 
                 max_allowed_risk_dollars = trading_capital * RISK_PERCENT
@@ -382,10 +274,9 @@ if ticker_input:
                 st.markdown("---")
                 st.subheader("🏆 Expected Formula Execution Output")
                 
-                st.markdown(f"• **Entry Price:** `${entry_val:.2f}`")
-                st.markdown(f"• **Profit Target:** `${target_val:.2f}`")
-                st.markdown(f"• **Stop Loss:** `${stop_val:.2f}`")
-                st.markdown(f"• **ATR (14d Volatility):** `{extracted_atr:.2f}`")
+                st.markdown(f"• **Entry Price:** `${entry:.2f}`")
+                st.markdown(f"• **Profit Target:** `${target:.2f}`")
+                st.markdown(f"• **Stop Loss:** `${stop:.2f}`")
                 
                 ror_indicator = "✅ Safe Metric" if ror >= 2.5 else ("⚠️ Moderate" if ror >= 2.0 else "❌ Warning Low")
                 st.markdown(f"• **Reward over Risk (RoR):** `{ror:.2f}` ({ror_indicator})")
@@ -410,9 +301,10 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
-                fig.add_hline(y=target_val, line_color="#00e5ff", line_width=2, line_dash="solid", label=dict(text=f"Target (${target_val:.2f})", textposition="top left", font=dict(color="#00e5ff")))
-                fig.add_hline(y=entry_val, line_color="#2196F3", line_width=2, line_dash="solid", label=dict(text=f"Entry (${entry_val:.2f})", textposition="top left", font=dict(color="#2196F3")))
-                fig.add_hline(y=stop_val, line_color="#ff9800", line_width=2, line_dash="dash", label=dict(text=f"Stop (${stop_val:.2f})", textposition="bottom left", font=dict(color="#ff9800")))
+                # Set textposition to left side alignments (Plotly shifts these cleanly to the left edge of the grid layout)
+                fig.add_hline(y=target, line_color="#00e5ff", line_width=2, line_dash="solid", label=dict(text=f"Target (${target:.2f})", textposition="top left", font=dict(color="#00e5ff")))
+                fig.add_hline(y=entry, line_color="#2196F3", line_width=2, line_dash="solid", label=dict(text=f"Entry (${entry:.2f})", textposition="top left", font=dict(color="#2196F3")))
+                fig.add_hline(y=stop, line_color="#ff9800", line_width=2, line_dash="dash", label=dict(text=f"Stop (${stop:.2f})", textposition="bottom left", font=dict(color="#ff9800")))
                 
                 fig.update_layout(
                     title=f"{ticker_input} Technical Matrix",
