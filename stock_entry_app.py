@@ -420,4 +420,26 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
                 fig.add_trace(go.Scatter(
-                    x=
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[target_final, target_final],
+                    mode="lines", line=dict(color="#00e5ff", width=2), name=f"Target: ${target_final:.2f}"
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[entry_final, entry_final],
+                    mode="lines", line=dict(color="#2196F3", width=2), name=f"Entry Price: ${entry_final:.2f}"
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[stop_final, stop_final],
+                    mode="lines", line=dict(color="#ff9800", width=2, dash="dash"), name=f"Stop Loss: ${stop_final:.2f}"
+                ))
+                
+                fig.update_layout(
+                    title=f"{ticker_input} Technical Matrix", template="plotly_dark",
+                    paper_bgcolor="#121212", plot_bgcolor="#1e1e1e", xaxis_rangeslider_visible=False,
+                    height=700, margin=dict(l=10, r=10, t=40, b=10), showlegend=True
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+        except Exception as e:
+            st.error(f"Execution Error Parsing Parameters: {str(e)}")
+else:
+    st.info("💡 Enter a stock ticker symbol in the configuration sidebar to initialize the real-time visual web entry terminal.")
