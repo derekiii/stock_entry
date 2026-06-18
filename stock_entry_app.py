@@ -213,23 +213,14 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
     pst_dt = None
     nxt_dt = None
     
-    # 1. CRITICAL PRIORITY: Extract true historical date using Finviz structural table
+    # 1. EXCLUSIVE PARSING LAYER FOR LAST EARNINGS DATE: Finviz Only
     finviz_last_date = scrape_finviz_last_earnings_date(ticker_symbol)
-    
     if finviz_last_date:
         pst_dt = finviz_last_date
-    elif cached_calendar and "Earnings Date" in cached_calendar:
-        # Fallback 1: Local yfinance index calendar arrays
-        try:
-            dates = cached_calendar["Earnings Date"]
-            if isinstance(dates, list) and len(dates) > 0:
-                parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
-                parsed_dates.sort()
-                pasts = [d for d in parsed_dates if d < today_date]
-                if pasts: pst_dt = pasts[-1]
-        except Exception: pass
+    else:
+        pst_dt = None # Explicitly strict: if Finviz scraper misses, it remains empty to output N/A
 
-    # Upcoming Date Fallback Resolution Route
+    # 2. Upcoming Date Resolution Route (Unmodified Fallback Hierarchy)
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
@@ -240,14 +231,19 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
                 if futures: nxt_dt = futures[0]
     except Exception: pass
 
-    # Fallback 2: Secondary backstop scraping pipeline
-    if not pst_dt and mb_fallback["past_earnings_date"]: pst_dt = mb_fallback["past_earnings_date"]
-    if not nxt_dt and mb_fallback["next_earnings_date"]: nxt_dt = mb_fallback["next_earnings_date"]
+    if not nxt_dt and mb_fallback["next_earnings_date"]: 
+        nxt_dt = mb_fallback["next_earnings_date"]
 
+    # 3. Formatting Outputs
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
         profile["past_days_val"] = (today_date - pst_dt).days
         profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
+    else:
+        profile["past_date"] = "N/A"
+        profile["past_elapsed"] = "N/A"
+        profile["past_days_val"] = None
+
     if nxt_dt:
         profile["next_date"] = nxt_dt.strftime("%b %d, %Y")
         profile["next_days_val"] = (nxt_dt - today_date).days
