@@ -62,26 +62,17 @@ def fetch_stock_data_cached(ticker_symbol):
 
 # --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS ---
 def scrape_finviz_fallback_data(ticker):
-    """
-    Scrapes Finviz to extract fundamental valuation metrics (P/E, Forward P/E, PEG)
-    when primary financial data pipelines return missing structures.
-    """
     fallback = {
         "trailing_pe": "N/A",
         "forward_pe": "N/A",
         "peg_ratio": "N/A"
     }
-    
     url = f"https://finviz.com/quote.ashx?t={ticker}"
     scraper = cloudscraper.create_scraper()
     try:
         response = scraper.get(url, timeout=10)
-        if response.status_code != 200:
-            return fallback
-            
+        if response.status_code != 200: return fallback
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Extract fundamental ratio values from the main metrics layout snapshot table
         snapshot_table = soup.find("table", class_="snapshot-table2")
         if snapshot_table:
             cells = snapshot_table.find_all("td")
@@ -96,22 +87,16 @@ def scrape_finviz_fallback_data(ticker):
                 elif cell_text == "PEG" and idx + 1 < len(cells):
                     val = cells[idx + 1].text.strip()
                     fallback["peg_ratio"] = float(val) if (val != "-" and val != "") else "N/A"
-    except Exception:
-        pass
+    except Exception: pass
     return fallback
 
 # --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT EARNINGS & TARGETS ---
 def scrape_marketbeat_fallback_data(ticker):
-    """
-    Scrapes MarketBeat to find fallback metrics (PE, Earnings Dates, MATP)
-    when Yahoo Finance returns empty dicts or rate limits the system.
-    """
     fallback = {
         "trailing_pe": "N/A", 
         "past_earnings_date": None, "next_earnings_date": None,
         "post_earnings_median_matp": None
     }
-    
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
     try:
@@ -119,18 +104,13 @@ def scrape_marketbeat_fallback_data(ticker):
         if response.status_code != 200:
             alt_url = f"https://www.marketbeat.com/stocks/NASDAQ/{ticker}/forecast/"
             response = scraper.get(alt_url, timeout=10)
-        if response.status_code != 200:
-            return fallback
+        if response.status_code != 200: return fallback
             
         soup = BeautifulSoup(response.text, 'html.parser')
         text_content = soup.get_text()
-            
-        # Extract P/E Ratio patterns from summary text blocks
         pe_match = re.search(r'P/E\s+ratio\s+of\s+(\d+(?:\.\d+)?)', text_content, re.IGNORECASE)
-        if pe_match:
-            fallback["trailing_pe"] = float(pe_match.group(1))
+        if pe_match: fallback["trailing_pe"] = float(pe_match.group(1))
 
-        # Process the Brokerage History Table to extract timelines and MATP targets
         history_table = None
         for table in soup.find_all("table"):
             first_row = table.find("tr")
@@ -144,7 +124,6 @@ def scrape_marketbeat_fallback_data(ticker):
             header_cells = [cell.text.lower().strip() for cell in history_table.find("tr").find_all(["th", "td"])]
             date_idx = next((i for i, h in enumerate(header_cells) if "date" in h), 0)
             target_idx = next((i for i, h in enumerate(header_cells) if "target" in h), 3)
-            
             scraped_dates = []
             post_earnings_targets = []
             
@@ -154,7 +133,6 @@ def scrape_marketbeat_fallback_data(ticker):
                 raw_date_str = cols[date_idx].text.strip()
                 raw_target_str = cols[target_idx].text.strip()
                 if "date" in raw_date_str.lower() or "brokerage" in raw_date_str.lower(): continue
-                    
                 cleaned_date_str = re.sub(r'^[A-Za-z]+,\s+', '', raw_date_str)
                 cleaned_date_str = re.sub(r'\s+', ' ', cleaned_date_str).replace(",", "").replace(".", "").strip()
                 
@@ -167,29 +145,19 @@ def scrape_marketbeat_fallback_data(ticker):
                 
                 if row_date:
                     scraped_dates.append(row_date)
-                    
-                    # Accumulate for MATP median parsing
                     final_target_segment = raw_target_str.split("➝")[-1].strip() if "➝" in raw_target_str else raw_target_str
                     numeric_match = re.search(r'\d+(?:\.\d+)?', final_target_segment.replace(",", ""))
-                    if numeric_match:
-                        post_earnings_targets.append(float(numeric_match.group(0)))
+                    if numeric_match: post_earnings_targets.append(float(numeric_match.group(0)))
             
             if scraped_dates:
                 today = datetime.now(timezone.utc).date()
                 pasts = [d for d in scraped_dates if d <= today]
                 futures = [d for d in scraped_dates if d > today]
-                
-                if pasts:
-                    fallback["past_earnings_date"] = max(pasts)
-                if futures:
-                    fallback["next_earnings_date"] = min(futures)
+                if pasts: fallback["past_earnings_date"] = max(pasts)
+                if futures: fallback["next_earnings_date"] = min(futures)
                 else:
-                    if fallback["past_earnings_date"]:
-                        fallback["next_earnings_date"] = fallback["past_earnings_date"] + timedelta(days=91)
-            
-            if post_earnings_targets:
-                fallback["post_earnings_median_matp"] = statistics.median(post_earnings_targets)
-                
+                    if fallback["past_earnings_date"]: fallback["next_earnings_date"] = fallback["past_earnings_date"] + timedelta(days=91)
+            if post_earnings_targets: fallback["post_earnings_median_matp"] = statistics.median(post_earnings_targets)
     except Exception: pass
     return fallback
 
@@ -202,7 +170,6 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
         "next_date": "N/A", "next_days": "N/A", "next_days_val": None,
         "trend_str": "", "is_3q_uptrend": False
     }
-
     pst_dt = None
     nxt_dt = None
     
@@ -218,16 +185,13 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
                 if pasts: pst_dt = pasts[-1]
     except Exception: pass
 
-    if not pst_dt and mb_fallback["past_earnings_date"]:
-        pst_dt = mb_fallback["past_earnings_date"]
-    if not nxt_dt and mb_fallback["next_earnings_date"]:
-        nxt_dt = mb_fallback["next_earnings_date"]
+    if not pst_dt and mb_fallback["past_earnings_date"]: pst_dt = mb_fallback["past_earnings_date"]
+    if not nxt_dt and mb_fallback["next_earnings_date"]: nxt_dt = mb_fallback["next_earnings_date"]
 
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
         profile["past_days_val"] = (today_date - pst_dt).days
         profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
-        
     if nxt_dt:
         profile["next_date"] = nxt_dt.strftime("%b %d, %Y")
         profile["next_days_val"] = (nxt_dt - today_date).days
@@ -245,12 +209,9 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
             pct_values.reverse()
             trend_formatted = [f"{'▲' if p>0 else '▼' if p<0 else '►'} {int(p)}%" for p in pct_values]
             profile["trend_str"] = " | Trends: " + " -> ".join(trend_formatted)
-            if len(pct_values) >= 3 and all(p > 0 for p in pct_values):
-                profile["is_3q_uptrend"] = True
+            if len(pct_values) >= 3 and all(p > 0 for p in pct_values): profile["is_3q_uptrend"] = True
     except Exception: pass
-    
     return profile
-
 
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
@@ -264,7 +225,6 @@ st.markdown("""
 
 st.title("🎯 Entry Matrix Terminal")
 
-# Sidebar Controller
 with st.sidebar:
     st.header("⚙️ Configuration Engine")
     ticker_input = st.text_input("Ticker Symbol", value="", placeholder="e.g. AAPL").strip().upper()
@@ -278,7 +238,6 @@ if ticker_input:
         if error_msg:
             st.error(error_msg)
             st.stop()
-            
         if dataset is None:
             st.warning("No structural profile returned from core cache pool layer. Try again in a brief moment.")
             st.stop()
@@ -304,55 +263,40 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            # Run background processing fallback metrics
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
-            # EXCLUSIVE: Resolve Sector/Industry data entirely from yFinance info dictionary maps
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
             industry_name = info.get('industry', 'N/A') if info else 'N/A'
             detailed_sector_str = f"{sector_name} - {industry_name}" if industry_name != 'N/A' else sector_name
                 
-            # Resolve Trailing P/E
             trailing_pe = info.get("trailingPE", "N/A") if info else "N/A"
-            if trailing_pe == "N/A": 
-                trailing_pe = finviz_data["trailing_pe"]
-            if trailing_pe == "N/A": 
-                trailing_pe = mb_data["trailing_pe"]
+            if trailing_pe == "N/A": trailing_pe = finviz_data["trailing_pe"]
+            if trailing_pe == "N/A": trailing_pe = mb_data["trailing_pe"]
                 
-            # Resolve Forward P/E
             forward_pe = info.get("forwardPE", "N/A") if info else "N/A"
-            if forward_pe == "N/A":
-                forward_pe = finviz_data["forward_pe"]
+            if forward_pe == "N/A": forward_pe = finviz_data["forward_pe"]
                 
-            # Resolve PEG Ratio
             peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
-            if peg_ratio == "N/A":
-                peg_ratio = finviz_data["peg_ratio"]
+            if peg_ratio == "N/A": peg_ratio = finviz_data["peg_ratio"]
                 
             target_mean_price = info.get("targetMeanPrice") if info else None
-            
-            # Resolve Consensus Price targets & Earnings lines
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             earn = get_earnings_profile(calendar, quarterly_income, mb_data)
             
             def style_metric_val(val, threshold, is_peg=False):
-                if val == "N/A" or not isinstance(val, (int, float)):
-                    return f"`{val}`"
+                if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
                 formatted_val = f"{val:.2f}"
                 is_good = (val <= threshold) if not is_peg else (0 < val <= threshold)
-                color = "#00e676" if is_good else "#ff5252"
-                return f'<span style="color:{color}; font-weight:bold;">{formatted_val}</span>'
+                return f'<span style="color:{"#00e676" if is_good else "#ff5252"}; font-weight:bold;">{formatted_val}</span>'
 
             pe_styled = style_metric_val(trailing_pe, 30.0)
             fwd_pe_styled = style_metric_val(forward_pe, 30.0)
             peg_styled = style_metric_val(peg_ratio, 2.0, is_peg=True)
             
             def style_earnings_date(date_str, label, days_val):
-                if date_str == "N/A" or days_val is None:
-                    return f"`{date_str}`"
-                if abs(days_val) <= 7:
-                    return f'<span style="color:#ff5252; font-weight:bold;">{date_str} ({label})</span>'
+                if date_str == "N/A" or days_val is None: return f"`{date_str}`"
+                if abs(days_val) <= 7: return f'<span style="color:#ff5252; font-weight:bold;">{date_str} ({label})</span>'
                 return f'`{date_str}` ({label})'
 
             last_earn_styled = style_earnings_date(earn["past_date"], earn["past_elapsed"], earn["past_days_val"])
@@ -362,9 +306,7 @@ if ticker_input:
             
             with workspace_left:
                 st.subheader("📊 Core Market Analysis Profile")
-                
                 st.metric("Current Price", f"${current_price:.2f}")
-                
                 st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
                 trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "🟥 **NO CLEAR TREND / CONSOLIDATION**"
                 st.markdown(f"**Trend State:** {trend_status}")
@@ -373,47 +315,53 @@ if ticker_input:
                 st.markdown(f"**Forward P/E:** {fwd_pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**PEG Ratio:** {peg_styled}", unsafe_allow_html=True)
                 st.markdown(f"**MATP Price:** `${scraped_matp:.2f}`")
-                
                 st.markdown(f"**Last Earnings:** {last_earn_styled}", unsafe_allow_html=True)
                 st.markdown(f"**Next Earnings:** {next_earn_styled}", unsafe_allow_html=True)
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
                 st.markdown(f"**Quarterly Income Health:** {qh_text} {earn['trend_str']}")
-                
                 st.markdown("---")
+                
                 st.subheader("⚙️ Interactive Formula Adjustments")
                 
                 default_support = ema20 if abs(current_price - ema20) < abs(current_price - ema50) else ema50
                 default_resistance = scraped_matp
                 
-                default_entry = default_support * (1 + OFFSET_PCT)
-                default_target = default_resistance * (1 - 0.002)
-                default_stop = default_support - (1.5 * extracted_atr)
-                
+                # Setup session state metrics explicitly on ticker switch
                 if "prev_ticker" not in st.session_state or st.session_state.prev_ticker != ticker_input:
                     st.session_state.prev_ticker = ticker_input
                     st.session_state.val_support = float(default_support)
                     st.session_state.val_resistance = float(default_resistance)
-                    st.session_state.val_entry = float(default_entry)
-                    st.session_state.val_target = float(default_target)
-                    st.session_state.val_stop = float(default_stop)
+                    st.session_state.val_entry = float(default_support * (1 + OFFSET_PCT))
+                    st.session_state.val_target = float(default_resistance * (1 - 0.002))
+                    st.session_state.val_stop = float(default_support - (1.5 * extracted_atr))
 
-                def update_base_fields():
+                # --- INSTANT SYNCHRONIZATION CALLBACK LAYERS ---
+                def on_support_change():
+                    # If support updates, auto-recalculate downstream targets instantly
                     st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
-                    st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
                     st.session_state.val_stop = st.session_state.val_support - (1.5 * extracted_atr)
+
+                def on_resistance_change():
+                    # If resistance updates, recalculate profit targets instantly
+                    st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
 
                 grid_col1, grid_col2 = st.columns(2)
                 with grid_col1:
-                    support_val = st.number_input("Support Level", key="val_support", step=0.5, on_change=update_base_fields)
-                    entry_val = st.number_input("Entry Price", key="val_entry", step=0.5)
-                    stop_val = st.number_input("Stop Loss", key="val_stop", step=0.5)
+                    st.number_input("Support Level", key="val_support", step=0.5, on_change=on_support_change)
+                    st.number_input("Entry Price", key="val_entry", step=0.5)
+                    st.number_input("Stop Loss", key="val_stop", step=0.5)
                 with grid_col2:
-                    resistance_val = st.number_input("Resistance Level (MATP Source)", key="val_resistance", step=0.5, on_change=update_base_fields)
-                    target_val = st.number_input("Profit Target", key="val_target", step=0.5)
+                    st.number_input("Resistance Level (MATP Source)", key="val_resistance", step=0.5, on_change=on_resistance_change)
+                    st.number_input("Profit Target", key="val_target", step=0.5)
                 
-                unit_risk = abs(entry_val - stop_val)
-                unit_reward = abs(target_val - entry_val)
+                # DRIVE THE CALCULATIONS DIRECTLY FROM THE STATE BINDINGS
+                entry_final = st.session_state.val_entry
+                stop_final = st.session_state.val_stop
+                target_final = st.session_state.val_target
+                
+                unit_risk = abs(entry_final - stop_final)
+                unit_reward = abs(target_final - entry_final)
                 ror = unit_reward / unit_risk if unit_risk > 0 else 0.0
                 
                 max_allowed_risk_dollars = trading_capital * RISK_PERCENT
@@ -424,9 +372,9 @@ if ticker_input:
                 st.markdown("---")
                 st.subheader("🏆 Expected Formula Execution Output")
                 
-                st.markdown(f"• **Entry Price:** `${entry_val:.2f}`")
-                st.markdown(f"• **Profit Target:** `${target_val:.2f}`")
-                st.markdown(f"• **Stop Loss:** `${stop_val:.2f}`")
+                st.markdown(f"• **Entry Price:** `${entry_final:.2f}`")
+                st.markdown(f"• **Profit Target:** `${target_final:.2f}`")
+                st.markdown(f"• **Stop Loss:** `${stop_final:.2f}`")
                 st.markdown(f"• **ATR (14d Volatility):** `{extracted_atr:.2f}`")
                 
                 ror_indicator = "✅ Safe Metric" if ror >= 2.5 else ("⚠️ Moderate" if ror >= 2.0 else "❌ Warning Low")
@@ -438,57 +386,35 @@ if ticker_input:
                 
             with workspace_right:
                 st.subheader("📈 Strategic Entry Matrix Visualization")
-                
                 fig = go.Figure()
-                
-                # Base Candlestick Map
                 fig.add_trace(go.Candlestick(
                     x=chart_df.index, open=chart_df['Open'], high=chart_df['High'],
                     low=chart_df['Low'], close=chart_df['Close'],
                     increasing_line_color='#00e676', decreasing_line_color='#ff5252',
                     name="Price"
                 ))
-                
-                # Moving Averages
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA20'], line=dict(color='#ff5252', width=1.5), name="EMA20"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA50'], line=dict(color='#00e676', width=1.5), name="EMA50"))
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
                 fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()],
-                    y=[target_val, target_val],
-                    mode="lines",
-                    line=dict(color="#00e5ff", width=2, dash="solid"),
-                    name=f"Target: ${target_val:.2f}"
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[target_final, target_final],
+                    mode="lines", line=dict(color="#00e5ff", width=2), name=f"Target: ${target_final:.2f}"
                 ))
-                
                 fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()],
-                    y=[entry_val, entry_val],
-                    mode="lines",
-                    line=dict(color="#2196F3", width=2, dash="solid"),
-                    name=f"Entry Price: ${entry_val:.2f}"
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[entry_final, entry_final],
+                    mode="lines", line=dict(color="#2196F3", width=2), name=f"Entry Price: ${entry_final:.2f}"
                 ))
-                
                 fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()],
-                    y=[stop_val, stop_val],
-                    mode="lines",
-                    line=dict(color="#ff9800", width=2, dash="dash"),
-                    name=f"Stop Loss: ${stop_val:.2f}"
+                    x=[chart_df.index.min(), chart_df.index.max()], y=[stop_final, stop_final],
+                    mode="lines", line=dict(color="#ff9800", width=2, dash="dash"), name=f"Stop Loss: ${stop_final:.2f}"
                 ))
                 
                 fig.update_layout(
-                    title=f"{ticker_input} Technical Matrix",
-                    template="plotly_dark",
-                    paper_bgcolor="#121212",
-                    plot_bgcolor="#1e1e1e",
-                    xaxis_rangeslider_visible=False,
-                    height=700,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    showlegend=True
+                    title=f"{ticker_input} Technical Matrix", template="plotly_dark",
+                    paper_bgcolor="#121212", plot_bgcolor="#1e1e1e", xaxis_rangeslider_visible=False,
+                    height=700, margin=dict(l=10, r=10, t=40, b=10), showlegend=True
                 )
-                
                 st.plotly_chart(fig, use_container_width=True)
                 
         except Exception as e:
