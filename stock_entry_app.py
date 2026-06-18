@@ -60,7 +60,7 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- NEW HIGH-ACCURACY SCRAPER ENGINE: FINVIZ LAST EARNINGS DATE ---
+# --- SCRAPER ENGINE: FINVIZ LAST EARNINGS DATE ---
 def scrape_finviz_last_earnings_date(ticker):
     """
     Scrapes the 'Price Reaction to Earnings Reports' table from Finviz 
@@ -213,11 +213,13 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
     pst_dt = None
     nxt_dt = None
     
-    # 1. Prioritize the new accurate Finviz table layout for the last report date
+    # 1. CRITICAL PRIORITY: Extract true historical date using Finviz structural table
     finviz_last_date = scrape_finviz_last_earnings_date(ticker_symbol)
+    
     if finviz_last_date:
         pst_dt = finviz_last_date
     elif cached_calendar and "Earnings Date" in cached_calendar:
+        # Fallback 1: Local yfinance index calendar arrays
         try:
             dates = cached_calendar["Earnings Date"]
             if isinstance(dates, list) and len(dates) > 0:
@@ -238,7 +240,7 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
                 if futures: nxt_dt = futures[0]
     except Exception: pass
 
-    # Secondary backup fallback layer routing
+    # Fallback 2: Secondary backstop scraping pipeline
     if not pst_dt and mb_fallback["past_earnings_date"]: pst_dt = mb_fallback["past_earnings_date"]
     if not nxt_dt and mb_fallback["next_earnings_date"]: nxt_dt = mb_fallback["next_earnings_date"]
 
@@ -337,7 +339,6 @@ if ticker_input:
             target_mean_price = info.get("targetMeanPrice") if info else None
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             
-            # Call updated metrics processing engine passes ticker input directly
             earn = get_earnings_profile(ticker_input, calendar, quarterly_income, mb_data)
             
             def style_metric_val(val, threshold, is_peg=False):
