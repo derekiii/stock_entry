@@ -60,52 +60,13 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
-# --- SCRAPER ENGINE: FINVIZ LAST EARNINGS DATE ---
-def scrape_finviz_last_earnings_date(ticker):
-    """
-    Scrapes the 'Price Reaction to Earnings Reports' table from Finviz 
-    to extract the most recent historical earnings report date.
-    """
-    url = f"https://finviz.com/stock?t={ticker}&ta=1&p=d&ty=ea"
-    scraper = cloudscraper.create_scraper()
-    try:
-        response = scraper.get(url, timeout=10)
-        if response.status_code != 200:
-            return None
-            
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Look for tables containing the target section header text
-        for table in soup.find_all("table"):
-            if "Price Reaction to Earnings Reports" in table.get_text():
-                rows = table.find_all("tr")
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) >= 2:
-                        date_text = cells[0].text.strip()
-                        # Skip section headers or titles
-                        if "Report Date" in date_text or "Price Reaction" in date_text or not date_text:
-                            continue
-                        
-                        # Clean and handle whitespace boundaries (Finviz standard: 'MMM DD, YYYY')
-                        cleaned_date = re.sub(r'\s+', ' ', date_text).replace(",", "").strip()
-                        
-                        for fmt in ("%b %d %Y", "%B %d %Y", "%m/%d/%Y"):
-                            try:
-                                parsed_date = datetime.strptime(cleaned_date, fmt).date()
-                                return parsed_date
-                            except ValueError:
-                                continue
-    except Exception:
-        pass
-    return None
-
-# --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS ---
+# --- SCRAPER ENGINE: FINVIZ COMBINED METRICS SNAPSHOT ---
 def scrape_finviz_fallback_data(ticker):
     fallback = {
         "trailing_pe": "N/A",
         "forward_pe": "N/A",
-        "peg_ratio": "N/A"
+        "peg_ratio": "N/A",
+        "last_earnings_date": "N/A"
     }
     url = f"https://finviz.com/quote.ashx?t={ticker}"
     scraper = cloudscraper.create_scraper()
@@ -127,14 +88,31 @@ def scrape_finviz_fallback_data(ticker):
                 elif cell_text == "PEG" and idx + 1 < len(cells):
                     val = cells[idx + 1].text.strip()
                     fallback["peg_ratio"] = float(val) if (val != "-" and val != "") else "N/A"
+                elif cell_text == "Earnings" and idx + 1 < len(cells):
+                    val = cells[idx + 1].text.strip()
+                    if val != "-" and val != "":
+                        try:
+                            parts = val.split()
+                            if len(parts) >= 2:
+                                clean_date_str = f"{parts[0]} {parts[1]}"
+                                current_year = datetime.now().year
+                                formatted_str = f"{clean_date_str} {current_year}"
+                                for fmt in ("%b %d %Y", "%B %d %Y"):
+                                    try:
+                                        fallback["last_earnings_date"] = datetime.strptime(formatted_str, fmt).date()
+                                        break
+                                    except ValueError:
+                                        continue
+                        except Exception:
+                            fallback["last_earnings_date"] = "N/A"
     except Exception: pass
     return fallback
 
-# --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT EARNINGS & TARGETS ---
+# --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT TARGETS ---
 def scrape_marketbeat_fallback_data(ticker):
     fallback = {
         "trailing_pe": "N/A", 
-        "past_earnings_date": None, "next_earnings_date": None,
+        "next_earnings_date": None,
         "post_earnings_median_matp": None
     }
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
@@ -191,18 +169,14 @@ def scrape_marketbeat_fallback_data(ticker):
             
             if scraped_dates:
                 today = datetime.now(timezone.utc).date()
-                pasts = [d for d in scraped_dates if d <= today]
                 futures = [d for d in scraped_dates if d > today]
-                if pasts: fallback["past_earnings_date"] = max(pasts)
                 if futures: fallback["next_earnings_date"] = min(futures)
-                else:
-                    if fallback["past_earnings_date"]: fallback["next_earnings_date"] = fallback["past_earnings_date"] + timedelta(days=91)
             if post_earnings_targets: fallback["post_earnings_median_matp"] = statistics.median(post_earnings_targets)
     except Exception: pass
     return fallback
 
 # --- PROFILE MATRICES GENERATORS ---
-def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_fallback):
+def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finviz_data, mb_fallback):
     now = datetime.now(timezone.utc)
     today_date = now.date()  
     profile = {
@@ -213,14 +187,11 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
     pst_dt = None
     nxt_dt = None
     
-    # 1. EXCLUSIVE PARSING LAYER FOR LAST EARNINGS DATE: Finviz Only
-    finviz_last_date = scrape_finviz_last_earnings_date(ticker_symbol)
-    if finviz_last_date:
-        pst_dt = finviz_last_date
-    else:
-        pst_dt = None # Explicitly strict: if Finviz scraper misses, it remains empty to output N/A
+    # 1. STRICT PRIORITY FOR PAST DATE: Finviz Snapshot Only
+    if finviz_data["last_earnings_date"] != "N/A":
+        pst_dt = finviz_data["last_earnings_date"]
 
-    # 2. Upcoming Date Resolution Route (Unmodified Fallback Hierarchy)
+    # 2. Upcoming Date Fallback Resolution Route
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
@@ -234,7 +205,7 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_f
     if not nxt_dt and mb_fallback["next_earnings_date"]: 
         nxt_dt = mb_fallback["next_earnings_date"]
 
-    # 3. Formatting Outputs
+    # 3. Formatting Parameters
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
         profile["past_days_val"] = (today_date - pst_dt).days
@@ -315,6 +286,7 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
+            # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
@@ -335,7 +307,7 @@ if ticker_input:
             target_mean_price = info.get("targetMeanPrice") if info else None
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             
-            earn = get_earnings_profile(ticker_input, calendar, quarterly_income, mb_data)
+            earn = get_earnings_profile(ticker_input, calendar, quarterly_income, finviz_data, mb_data)
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
@@ -448,26 +420,4 @@ if ticker_input:
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA200'], line=dict(color='#e040fb', width=1.8), name="EMA200"))
                 
                 fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()], y=[target_final, target_final],
-                    mode="lines", line=dict(color="#00e5ff", width=2), name=f"Target: ${target_final:.2f}"
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()], y=[entry_final, entry_final],
-                    mode="lines", line=dict(color="#2196F3", width=2), name=f"Entry Price: ${entry_final:.2f}"
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[chart_df.index.min(), chart_df.index.max()], y=[stop_final, stop_final],
-                    mode="lines", line=dict(color="#ff9800", width=2, dash="dash"), name=f"Stop Loss: ${stop_final:.2f}"
-                ))
-                
-                fig.update_layout(
-                    title=f"{ticker_input} Technical Matrix", template="plotly_dark",
-                    paper_bgcolor="#121212", plot_bgcolor="#1e1e1e", xaxis_rangeslider_visible=False,
-                    height=700, margin=dict(l=10, r=10, t=40, b=10), showlegend=True
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-        except Exception as e:
-            st.error(f"Execution Error Parsing Parameters: {str(e)}")
-else:
-    st.info("💡 Enter a stock ticker symbol in the configuration sidebar to initialize the real-time visual web entry terminal.")
+                    x=
