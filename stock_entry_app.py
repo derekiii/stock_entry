@@ -60,6 +60,46 @@ def fetch_stock_data_cached(ticker_symbol):
         "quarterly_income": quarterly_income
     }, None
 
+# --- NEW HIGH-ACCURACY SCRAPER ENGINE: FINVIZ LAST EARNINGS DATE ---
+def scrape_finviz_last_earnings_date(ticker):
+    """
+    Scrapes the 'Price Reaction to Earnings Reports' table from Finviz 
+    to extract the most recent historical earnings report date.
+    """
+    url = f"https://finviz.com/stock?t={ticker}&ta=1&p=d&ty=ea"
+    scraper = cloudscraper.create_scraper()
+    try:
+        response = scraper.get(url, timeout=10)
+        if response.status_code != 200:
+            return None
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for tables containing the target section header text
+        for table in soup.find_all("table"):
+            if "Price Reaction to Earnings Reports" in table.get_text():
+                rows = table.find_all("tr")
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        date_text = cells[0].text.strip()
+                        # Skip section headers or titles
+                        if "Report Date" in date_text or "Price Reaction" in date_text or not date_text:
+                            continue
+                        
+                        # Clean and handle whitespace boundaries (Finviz standard: 'MMM DD, YYYY')
+                        cleaned_date = re.sub(r'\s+', ' ', date_text).replace(",", "").strip()
+                        
+                        for fmt in ("%b %d %Y", "%B %d %Y", "%m/%d/%Y"):
+                            try:
+                                parsed_date = datetime.strptime(cleaned_date, fmt).date()
+                                return parsed_date
+                            except ValueError:
+                                continue
+    except Exception:
+        pass
+    return None
+
 # --- SCRAPER FALLBACK ENGINE 1: FINVIZ FUNDAMENTALS ---
 def scrape_finviz_fallback_data(ticker):
     fallback = {
@@ -162,7 +202,7 @@ def scrape_marketbeat_fallback_data(ticker):
     return fallback
 
 # --- PROFILE MATRICES GENERATORS ---
-def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
+def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, mb_fallback):
     now = datetime.now(timezone.utc)
     today_date = now.date()  
     profile = {
@@ -173,6 +213,21 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
     pst_dt = None
     nxt_dt = None
     
+    # 1. Prioritize the new accurate Finviz table layout for the last report date
+    finviz_last_date = scrape_finviz_last_earnings_date(ticker_symbol)
+    if finviz_last_date:
+        pst_dt = finviz_last_date
+    elif cached_calendar and "Earnings Date" in cached_calendar:
+        try:
+            dates = cached_calendar["Earnings Date"]
+            if isinstance(dates, list) and len(dates) > 0:
+                parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
+                parsed_dates.sort()
+                pasts = [d for d in parsed_dates if d < today_date]
+                if pasts: pst_dt = pasts[-1]
+        except Exception: pass
+
+    # Upcoming Date Fallback Resolution Route
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
@@ -180,11 +235,10 @@ def get_earnings_profile(cached_calendar, cached_financials, mb_fallback):
                 parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
                 parsed_dates.sort()
                 futures = [d for d in parsed_dates if d >= today_date]
-                pasts = [d for d in parsed_dates if d < today_date]
                 if futures: nxt_dt = futures[0]
-                if pasts: pst_dt = pasts[-1]
     except Exception: pass
 
+    # Secondary backup fallback layer routing
     if not pst_dt and mb_fallback["past_earnings_date"]: pst_dt = mb_fallback["past_earnings_date"]
     if not nxt_dt and mb_fallback["next_earnings_date"]: nxt_dt = mb_fallback["next_earnings_date"]
 
@@ -282,7 +336,9 @@ if ticker_input:
                 
             target_mean_price = info.get("targetMeanPrice") if info else None
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
-            earn = get_earnings_profile(calendar, quarterly_income, mb_data)
+            
+            # Call updated metrics processing engine passes ticker input directly
+            earn = get_earnings_profile(ticker_input, calendar, quarterly_income, mb_data)
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
@@ -338,12 +394,10 @@ if ticker_input:
 
                 # --- INSTANT SYNCHRONIZATION CALLBACK LAYERS ---
                 def on_support_change():
-                    # If support updates, auto-recalculate downstream targets instantly
                     st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
                     st.session_state.val_stop = st.session_state.val_support - (1.5 * extracted_atr)
 
                 def on_resistance_change():
-                    # If resistance updates, recalculate profit targets instantly
                     st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
 
                 grid_col1, grid_col2 = st.columns(2)
@@ -355,7 +409,6 @@ if ticker_input:
                     st.number_input("Resistance Level (MATP Source)", key="val_resistance", step=0.5, on_change=on_resistance_change)
                     st.number_input("Profit Target", key="val_target", step=0.5)
                 
-                # DRIVE THE CALCULATIONS DIRECTLY FROM THE STATE BINDINGS
                 entry_final = st.session_state.val_entry
                 stop_final = st.session_state.val_stop
                 target_final = st.session_state.val_target
