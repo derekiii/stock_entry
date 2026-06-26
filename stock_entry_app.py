@@ -359,19 +359,25 @@ if ticker_input:
                     st.session_state.val_resistance = float(default_resistance)
                     st.session_state.val_entry = float(default_support * (1 + OFFSET_PCT))
                     st.session_state.val_target = float(default_resistance * (1 - 0.002))
+                    st.session_state.val_atr_mult = 1.5  # Initialized ATR multiplier state
                     st.session_state.val_stop = float(default_support - (1.5 * extracted_atr))
 
                 # --- INSTANT SYNCHRONIZATION CALLBACK LAYERS ---
                 def on_support_change():
                     st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
-                    st.session_state.val_stop = st.session_state.val_support - (1.5 * extracted_atr)
+                    st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
 
                 def on_resistance_change():
                     st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
 
+                def on_mult_change():
+                    # Recalculates stop loss directly when the multiplier number changes
+                    st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
+
                 grid_col1, grid_col2 = st.columns(2)
                 with grid_col1:
                     st.number_input("Support Level", key="val_support", step=0.5, on_change=on_support_change)
+                    st.number_input("ATR Multiplier", key="val_atr_mult", step=0.1, min_value=0.1, on_change=on_mult_change)
                     st.number_input("Entry Price", key="val_entry", step=0.5)
                     st.number_input("Stop Loss", key="val_stop", step=0.5)
                 with grid_col2:
@@ -381,6 +387,7 @@ if ticker_input:
                 entry_final = st.session_state.val_entry
                 stop_final = st.session_state.val_stop
                 target_final = st.session_state.val_target
+                atr_mult_final = st.session_state.val_atr_mult
                 
                 unit_risk = abs(entry_final - stop_final)
                 unit_reward = abs(target_final - entry_final)
@@ -396,7 +403,7 @@ if ticker_input:
                 
                 st.markdown(f"• **Entry Price:** `${entry_final:.2f}`")
                 st.markdown(f"• **Profit Target:** `${target_final:.2f}`")
-                st.markdown(f"• **Stop Loss:** `${stop_final:.2f}`")
+                st.markdown(f"• **Stop Loss:** `${stop_final:.2f}` *(Using {atr_mult_final:.1f}x ATR)*")
                 st.markdown(f"• **ATR (14d Volatility):** `{extracted_atr:.2f}`")
                 
                 ror_indicator = "✅ Safe Metric" if ror >= 2.5 else ("⚠️ Moderate" if ror >= 2.0 else "❌ Warning Low")
