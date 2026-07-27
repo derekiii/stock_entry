@@ -7,58 +7,84 @@ from datetime import datetime, timezone, timedelta
 import cloudscraper
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 # Global system trading parameters
 DEFAULT_GLOBAL_CAPITAL = 6000.00  
 RISK_PERCENT = 0.01       # 1% max risk per trade
 OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 
+def get_yfinance_session():
+    """
+    Creates a requests Session with a realistic browser User-Agent 
+    and automatic retries to bypass Streamlit Cloud IP rate limits.
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    })
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    return session
+
 # --- STREAMLIT CACHING ENGINE TO BYPASS CLOUD RATE LIMITS ---
-@st.cache_data(ttl=300)  # Caches results for 5 minutes (300 seconds)
+@st.cache_data(ttl=600)  # Extended cache duration to 10 minutes to minimize IP hits
 def fetch_stock_data_cached(ticker_symbol):
     """
     Fetches historical data, calendar information, ticker info stats, and financials
-    in a single cached block to protect the cloud IP from Yahoo rate limits.
+    using a custom session to bypass Yahoo's server-side rate limits.
     """
-    ticker = yf.Ticker(ticker_symbol)
+    session = get_yfinance_session()
+    ticker = yf.Ticker(ticker_symbol, session=session)
     
-    # 1. Fetch History
-    full_df = ticker.history(period="1y", interval="1d")
-    if full_df.empty or len(full_df) < 200:
-        return None, "Insufficient historical market engine metrics returned."
-    
-    full_df.columns = [str(col).strip() for col in full_df.columns]
-    full_df["EMA20"] = full_df["Close"].ewm(span=20, adjust=False).mean()
-    full_df["EMA50"] = full_df["Close"].ewm(span=50, adjust=False).mean()
-    full_df["EMA200"] = full_df["Close"].ewm(span=200, adjust=False).mean()
-    
-    # 2. Extract Key Info Stats Safely
-    info_dict = {}
     try:
-        info_dict = ticker.info
-    except Exception:
-        pass
+        # 1. Fetch History
+        full_df = ticker.history(period="1y", interval="1d")
+        if full_df.empty or len(full_df) < 200:
+            return None, "Insufficient historical market engine metrics returned."
         
-    # 3. Pull Earnings Calendar Safely
-    calendar_dict = {}
-    try:
-        calendar_dict = ticker.calendar
-    except Exception:
-        pass
+        full_df.columns = [str(col).strip() for col in full_df.columns]
+        full_df["EMA20"] = full_df["Close"].ewm(span=20, adjust=False).mean()
+        full_df["EMA50"] = full_df["Close"].ewm(span=50, adjust=False).mean()
+        full_df["EMA200"] = full_df["Close"].ewm(span=200, adjust=False).mean()
+        
+        # 2. Extract Key Info Stats Safely
+        info_dict = {}
+        try:
+            info_dict = ticker.info
+        except Exception:
+            pass
+            
+        # 3. Pull Earnings Calendar Safely
+        calendar_dict = {}
+        try:
+            calendar_dict = ticker.calendar
+        except Exception:
+            pass
 
-    # 4. Pull Financials for Trend Stats Safely
-    quarterly_income = None
-    try:
-        quarterly_income = ticker.quarterly_income_stmt
-    except Exception:
-        pass
-        
-    return {
-        "df": full_df,
-        "info": info_dict,
-        "calendar": calendar_dict,
-        "quarterly_income": quarterly_income
-    }, None
+        # 4. Pull Financials for Trend Stats Safely
+        quarterly_income = None
+        try:
+            quarterly_income = ticker.quarterly_income_stmt
+        except Exception:
+            pass
+            
+        return {
+            "df": full_df,
+            "info": info_dict,
+            "calendar": calendar_dict,
+            "quarterly_income": quarterly_income
+        }, None
+
+    except Exception as e:
+        # Catch YFRateLimitError or generic rate limit blocks gracefully
+        if "YFRateLimitError" in str(type(e)) or "Rate" in str(e):
+            return None, "⚠️ Yahoo Finance API is currently rate-limiting shared Streamlit Cloud requests. Please wait a minute or re-run the query."
+        return None, f"Data Retrieval Error: {str(e)}"
 
 # --- SCRAPER ENGINE: FINVIZ COMBINED METRICS SNAPSHOT ---
 def scrape_finviz_fallback_data(ticker):
