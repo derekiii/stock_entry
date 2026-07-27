@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import re
 import statistics
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import cloudscraper
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
@@ -18,34 +18,34 @@ OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 
 def get_yfinance_session():
     """
-    Creates a requests Session with a realistic browser User-Agent 
-    and automatic retries to bypass Streamlit Cloud IP rate limits.
+    Creates a requests Session with realistic browser headers 
+    and strict retry configurations to prevent endless hanging.
     """
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
     })
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     return session
 
 # --- STREAMLIT CACHING ENGINE TO BYPASS CLOUD RATE LIMITS ---
-@st.cache_data(ttl=600)  # Extended cache duration to 10 minutes to minimize IP hits
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_stock_data_cached(ticker_symbol):
     """
-    Fetches historical data, calendar information, ticker info stats, and financials
-    using a custom session to bypass Yahoo's server-side rate limits.
+    Fetches historical data, calendar information, ticker info stats, and financials.
+    Strict timeouts are enforced so the app fails fast if Yahoo hangs.
     """
-    session = get_yfinance_session()
-    ticker = yf.Ticker(ticker_symbol, session=session)
-    
     try:
-        # 1. Fetch History
-        full_df = ticker.history(period="1y", interval="1d")
-        if full_df.empty or len(full_df) < 200:
-            return None, "Insufficient historical market engine metrics returned."
+        session = get_yfinance_session()
+        ticker = yf.Ticker(ticker_symbol, session=session)
+        
+        # 1. Fetch History with explicit period check
+        full_df = ticker.history(period="1y", interval="1d", timeout=8)
+        if full_df is None or full_df.empty or len(full_df) < 50:
+            return None, f"Insufficient price data returned for symbol '{ticker_symbol}'."
         
         full_df.columns = [str(col).strip() for col in full_df.columns]
         full_df["EMA20"] = full_df["Close"].ewm(span=20, adjust=False).mean()
@@ -81,10 +81,10 @@ def fetch_stock_data_cached(ticker_symbol):
         }, None
 
     except Exception as e:
-        # Catch YFRateLimitError or generic rate limit blocks gracefully
-        if "YFRateLimitError" in str(type(e)) or "Rate" in str(e):
-            return None, "⚠️ Yahoo Finance API is currently rate-limiting shared Streamlit Cloud requests. Please wait a minute or re-run the query."
-        return None, f"Data Retrieval Error: {str(e)}"
+        err_msg = str(e)
+        if "YFRateLimitError" in err_msg or "429" in err_msg:
+            return None, "⚠️ Yahoo Finance API is currently rate-limiting shared Streamlit cloud requests. Please retry in 1 minute."
+        return None, f"Unable to retrieve data for '{ticker_symbol}': {err_msg}"
 
 # --- SCRAPER ENGINE: FINVIZ COMBINED METRICS SNAPSHOT ---
 def scrape_finviz_fallback_data(ticker):
@@ -97,7 +97,7 @@ def scrape_finviz_fallback_data(ticker):
     url = f"https://finviz.com/quote.ashx?t={ticker}"
     scraper = cloudscraper.create_scraper()
     try:
-        response = scraper.get(url, timeout=10)
+        response = scraper.get(url, timeout=5) # 5s strict timeout
         if response.status_code != 200: return fallback
         soup = BeautifulSoup(response.text, 'html.parser')
         snapshot_table = soup.find("table", class_="snapshot-table2")
@@ -144,10 +144,10 @@ def scrape_marketbeat_fallback_data(ticker):
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
     try:
-        response = scraper.get(url, timeout=10)
+        response = scraper.get(url, timeout=5) # 5s strict timeout
         if response.status_code != 200:
             alt_url = f"https://www.marketbeat.com/stocks/NASDAQ/{ticker}/forecast/"
-            response = scraper.get(alt_url, timeout=10)
+            response = scraper.get(alt_url, timeout=5)
         if response.status_code != 200: return fallback
             
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -213,11 +213,9 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finv
     pst_dt = None
     nxt_dt = None
     
-    # 1. STRICT PRIORITY FOR PAST DATE: Finviz Snapshot Only
     if finviz_data["last_earnings_date"] != "N/A":
         pst_dt = finviz_data["last_earnings_date"]
 
-    # 2. Upcoming Date Fallback Resolution Route
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
@@ -231,15 +229,10 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finv
     if not nxt_dt and mb_fallback["next_earnings_date"]: 
         nxt_dt = mb_fallback["next_earnings_date"]
 
-    # 3. Formatting Parameters
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
         profile["past_days_val"] = (today_date - pst_dt).days
         profile["past_elapsed"] = f"{profile['past_days_val']}d ago"
-    else:
-        profile["past_date"] = "N/A"
-        profile["past_elapsed"] = "N/A"
-        profile["past_days_val"] = None
 
     if nxt_dt:
         profile["next_date"] = nxt_dt.strftime("%b %d, %Y")
@@ -281,14 +274,11 @@ with st.sidebar:
     st.markdown("---")
 
 if ticker_input:
-    with st.spinner(f"Analyzing {ticker_input} profiles safely from multi-layer data channels..."):
+    with st.spinner(f"Analyzing {ticker_input} profiles..."):
         dataset, error_msg = fetch_stock_data_cached(ticker_input)
         
         if error_msg:
             st.error(error_msg)
-            st.stop()
-        if dataset is None:
-            st.warning("No structural profile returned from core cache pool layer. Try again in a brief moment.")
             st.stop()
             
         try:
@@ -312,7 +302,6 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
-            # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
@@ -359,7 +348,7 @@ if ticker_input:
                 st.subheader("📊 Core Market Analysis Profile")
                 st.metric("Current Price", f"${current_price:.2f}")
                 st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
-                trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "🟥 **NO CLEAR TREND / CONSOLIDATION**"
+                trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "ext🟨 **NO CLEAR TREND / CONSOLIDATION**"
                 st.markdown(f"**Trend State:** {trend_status}")
                 
                 st.markdown(f"**Trailing P/E:** {pe_styled}", unsafe_allow_html=True)
@@ -378,17 +367,15 @@ if ticker_input:
                 default_support = ema20 if abs(current_price - ema20) < abs(current_price - ema50) else ema50
                 default_resistance = scraped_matp
                 
-                # Setup session state metrics explicitly on ticker switch
                 if "prev_ticker" not in st.session_state or st.session_state.prev_ticker != ticker_input:
                     st.session_state.prev_ticker = ticker_input
                     st.session_state.val_support = float(default_support)
                     st.session_state.val_resistance = float(default_resistance)
                     st.session_state.val_entry = float(default_support * (1 + OFFSET_PCT))
                     st.session_state.val_target = float(default_resistance * (1 - 0.002))
-                    st.session_state.val_atr_mult = 1.5  # Initialized ATR multiplier state
+                    st.session_state.val_atr_mult = 1.5
                     st.session_state.val_stop = float(default_support - (1.5 * extracted_atr))
 
-                # --- INSTANT SYNCHRONIZATION CALLBACK LAYERS ---
                 def on_support_change():
                     st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
                     st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
@@ -397,7 +384,6 @@ if ticker_input:
                     st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
 
                 def on_mult_change():
-                    # Recalculates stop loss directly when the multiplier number changes
                     st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
 
                 grid_col1, grid_col2 = st.columns(2)
