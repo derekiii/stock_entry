@@ -456,6 +456,78 @@ def calculate_post_earnings_matp(marketbeat_data, last_earnings_date):
 
     return statistics.median(targets), len(targets)
 
+
+# --- SCRAPER FALLBACK: STOCKANALYSIS EARNINGS HISTORY ---
+@st.cache_data(ttl=1800)
+def scrape_stockanalysis_earnings_history(ticker):
+    """
+    Retrieve historical earnings announcement dates from StockAnalysis'
+    earnings page. The overview page's Earnings Date can be the next event,
+    so this separate history page is used for LAST earnings.
+    """
+    fallback = {"last_earnings_date": None, "next_earnings_date": None}
+
+    url = f"https://stockanalysis.com/stocks/{ticker.lower()}/history/"
+    scraper = cloudscraper.create_scraper()
+
+    try:
+        response = scraper.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if response.status_code != 200:
+            return fallback
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Try structured date text first.
+        dates = []
+        for node in soup.find_all(string=re.compile(r"\b20\d{2}\b")):
+            value = re.sub(r"\s+", " ", str(node)).strip()
+            for match in re.findall(
+                r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                r"\s+\d{1,2},\s+20\d{2}",
+                value
+            ):
+                try:
+                    dates.append(
+                        datetime.strptime(match, "%b %d, %Y").date()
+                    )
+                except ValueError:
+                    pass
+
+        # Also inspect table cells, which is more reliable on some layouts.
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
+                cells = [
+                    re.sub(r"\s+", " ", c.get_text(" ", strip=True))
+                    for c in row.find_all(["td", "th"])
+                ]
+                for cell in cells:
+                    for fmt in ("%b %d, %Y", "%B %d, %Y"):
+                        try:
+                            d = datetime.strptime(cell, fmt).date()
+                            dates.append(d)
+                            break
+                        except ValueError:
+                            continue
+
+        today = datetime.now(timezone.utc).date()
+        past = sorted({d for d in dates if d <= today})
+        future = sorted({d for d in dates if d > today})
+
+        if past:
+            fallback["last_earnings_date"] = max(past)
+        if future:
+            fallback["next_earnings_date"] = min(future)
+
+    except Exception:
+        pass
+
+    return fallback
+
+
 # --- PROFILE MATRICES GENERATORS ---
 def _to_date(value):
     """Convert common Yahoo/HTML date values into a date."""
@@ -519,7 +591,12 @@ def get_yahoo_earnings_dates(earnings_dates, earnings_history=None):
     )
 
 
-def get_earnings_diagnostics(cached_earnings_dates, finviz_data, stockanalysis_data=None):
+def get_earnings_diagnostics(
+    cached_earnings_dates,
+    finviz_data,
+    stockanalysis_data=None,
+    stockanalysis_history=None
+):
     yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
     return {
         "yahoo_last": yahoo_past,
@@ -532,6 +609,10 @@ def get_earnings_diagnostics(cached_earnings_dates, finviz_data, stockanalysis_d
             stockanalysis_data.get("next_earnings_date")
             if stockanalysis_data else None
         ),
+        "stockanalysis_history_last": (
+            stockanalysis_history.get("last_earnings_date")
+            if stockanalysis_history else None
+        ),
         "finviz_last": (
             finviz_data.get("last_earnings_date")
             if finviz_data else "N/A"
@@ -541,7 +622,7 @@ def get_earnings_diagnostics(cached_earnings_dates, finviz_data, stockanalysis_d
 
 def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
                          cached_earnings_history, cached_financials, finviz_data,
-                         stockanalysis_data, mb_fallback):
+                         stockanalysis_data, stockanalysis_history, mb_fallback):
     today_date = datetime.now(timezone.utc).date()
 
     profile = {
@@ -568,12 +649,17 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
     if yahoo_past:
         pst_dt = yahoo_past
         profile["past_source"] = "Yahoo"
+    elif stockanalysis_history.get("last_earnings_date"):
+        candidate = _to_date(
+            stockanalysis_history.get("last_earnings_date")
+        )
+        if candidate and candidate <= today_date:
+            pst_dt = candidate
+            profile["past_source"] = "StockAnalysis History"
     elif stockanalysis_data.get("last_earnings_date"):
         candidate = _to_date(
             stockanalysis_data.get("last_earnings_date")
         )
-        # StockAnalysis' overview "Earnings Date" can represent the next
-        # scheduled earnings event. Never treat a future date as "Last Earnings".
         if candidate and candidate <= today_date:
             pst_dt = candidate
             profile["past_source"] = "StockAnalysis"
@@ -1015,6 +1101,7 @@ if ticker_input:
             # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             stockanalysis_data = scrape_stockanalysis_earnings(ticker_input)
+            stockanalysis_history = scrape_stockanalysis_earnings_history(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
@@ -1040,6 +1127,7 @@ if ticker_input:
                 quarterly_income,
                 finviz_data,
                 stockanalysis_data,
+                stockanalysis_history,
                 mb_data
             )
 
