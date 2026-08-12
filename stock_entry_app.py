@@ -160,6 +160,69 @@ def scrape_finviz_fallback_data(ticker):
     except Exception: pass
     return fallback
 
+
+# --- SCRAPER FALLBACK ENGINE: STOCKANALYSIS EARNINGS ---
+@st.cache_data(ttl=1800)
+def scrape_stockanalysis_earnings(ticker):
+    """
+    Extract the reported earnings announcement date from StockAnalysis.
+
+    StockAnalysis currently exposes an "Earnings Date" field on the stock
+    overview page. This is used as a fallback when Yahoo does not return a
+    usable historical earnings-calendar date.
+    """
+    fallback = {"last_earnings_date": None, "next_earnings_date": None}
+
+    url = f"https://stockanalysis.com/stocks/{ticker.lower()}/"
+    scraper = cloudscraper.create_scraper()
+
+    try:
+        response = scraper.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if response.status_code != 200:
+            return fallback
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+
+        # Current StockAnalysis page format:
+        # "... Earnings Date | Jul 30, 2026 ..."
+        match = re.search(
+            r"Earnings Date\s*\|\s*([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})",
+            page_text
+        )
+
+        if match:
+            try:
+                fallback["last_earnings_date"] = datetime.strptime(
+                    match.group(1), "%b %d, %Y"
+                ).date()
+            except ValueError:
+                pass
+
+        # Some pages may use "Earnings Date Jul 30, 2026" without a pipe.
+        if fallback["last_earnings_date"] is None:
+            match = re.search(
+                r"Earnings Date\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})",
+                page_text
+            )
+            if match:
+                try:
+                    fallback["last_earnings_date"] = datetime.strptime(
+                        match.group(1), "%b %d, %Y"
+                    ).date()
+                except ValueError:
+                    pass
+
+    except Exception:
+        pass
+
+    return fallback
+
+
 # --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT TARGETS ---
 @st.cache_data(ttl=1800)
 def scrape_marketbeat_fallback_data(ticker):
@@ -291,11 +354,15 @@ def get_yahoo_earnings_dates(earnings_dates, earnings_history=None):
     )
 
 
-def get_earnings_diagnostics(cached_earnings_dates, finviz_data):
+def get_earnings_diagnostics(cached_earnings_dates, finviz_data, stockanalysis_data=None):
     yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
     return {
         "yahoo_last": yahoo_past,
         "yahoo_next": yahoo_next,
+        "stockanalysis_last": (
+            stockanalysis_data.get("last_earnings_date")
+            if stockanalysis_data else None
+        ),
         "finviz_last": (
             finviz_data.get("last_earnings_date")
             if finviz_data else "N/A"
@@ -304,7 +371,8 @@ def get_earnings_diagnostics(cached_earnings_dates, finviz_data):
 
 
 def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
-                         cached_earnings_history, cached_financials, finviz_data, mb_fallback):
+                         cached_earnings_history, cached_financials, finviz_data,
+                         stockanalysis_data, mb_fallback):
     today_date = datetime.now(timezone.utc).date()
 
     profile = {
@@ -317,12 +385,24 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
     pst_dt = None
     nxt_dt = None
 
-    # Last earnings: Yahoo historical earnings dates first.
+    # Last earnings = actual earnings announcement date.
+    #
+    # Priority:
+    # 1. Yahoo earnings calendar
+    # 2. StockAnalysis earnings-date field
+    # 3. Finviz snapshot
+    #
+    # We intentionally do NOT use earnings_history here because its date
+    # can represent a reporting/fiscal period rather than the announcement.
     yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
 
     if yahoo_past:
         pst_dt = yahoo_past
         profile["past_source"] = "Yahoo"
+    elif stockanalysis_data.get("last_earnings_date"):
+        pst_dt = _to_date(stockanalysis_data.get("last_earnings_date"))
+        if pst_dt:
+            profile["past_source"] = "StockAnalysis"
     elif finviz_data.get("last_earnings_date") != "N/A":
         pst_dt = _to_date(finviz_data.get("last_earnings_date"))
         if pst_dt:
@@ -577,6 +657,7 @@ if ticker_input:
 
             # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
+            stockanalysis_data = scrape_stockanalysis_earnings(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
             sector_name = info.get('sector', 'N/A') if info else 'N/A'
@@ -603,6 +684,7 @@ if ticker_input:
                 earnings_history,
                 quarterly_income,
                 finviz_data,
+                stockanalysis_data,
                 mb_data
             )
             
