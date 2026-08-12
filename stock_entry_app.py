@@ -461,13 +461,19 @@ def calculate_post_earnings_matp(marketbeat_data, last_earnings_date):
 @st.cache_data(ttl=1800)
 def scrape_stockanalysis_earnings_history(ticker):
     """
-    Retrieve historical earnings announcement dates from StockAnalysis'
-    earnings page. The overview page's Earnings Date can be the next event,
-    so this separate history page is used for LAST earnings.
-    """
-    fallback = {"last_earnings_date": None, "next_earnings_date": None}
+    Retrieve the latest actual earnings announcement from StockAnalysis'
+    earnings-call transcript page.
 
-    url = f"https://stockanalysis.com/stocks/{ticker.lower()}/history/"
+    We intentionally use /transcripts/ rather than /history/: /history/ is
+    stock-price history and therefore must never be used as an earnings-date
+    source.
+    """
+    fallback = {
+        "last_earnings_date": None,
+        "next_earnings_date": None
+    }
+
+    url = f"https://stockanalysis.com/stocks/{ticker.lower()}/transcripts/"
     scraper = cloudscraper.create_scraper()
 
     try:
@@ -476,49 +482,50 @@ def scrape_stockanalysis_earnings_history(ticker):
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"}
         )
+
         if response.status_code != 200:
             return fallback
 
         soup = BeautifulSoup(response.text, "html.parser")
+        page_text = re.sub(
+            r"\s+",
+            " ",
+            soup.get_text(" ", strip=True)
+        )
 
-        # Try structured date text first.
+        # StockAnalysis transcript listings use entries such as:
+        # "Earnings Call: Q1 2027 May 20, 2026"
+        matches = re.findall(
+            r"Earnings Call:\s*Q[1-4]\s+\d{4}\s+"
+            r"([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})",
+            page_text
+        )
+
         dates = []
-        for node in soup.find_all(string=re.compile(r"\b20\d{2}\b")):
-            value = re.sub(r"\s+", " ", str(node)).strip()
-            for match in re.findall(
-                r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-                r"\s+\d{1,2},\s+20\d{2}",
-                value
-            ):
-                try:
-                    dates.append(
-                        datetime.strptime(match, "%b %d, %Y").date()
-                    )
-                except ValueError:
-                    pass
 
-        # Also inspect table cells, which is more reliable on some layouts.
-        for table in soup.find_all("table"):
-            for row in table.find_all("tr"):
-                cells = [
-                    re.sub(r"\s+", " ", c.get_text(" ", strip=True))
-                    for c in row.find_all(["td", "th"])
-                ]
-                for cell in cells:
-                    for fmt in ("%b %d, %Y", "%B %d, %Y"):
-                        try:
-                            d = datetime.strptime(cell, fmt).date()
-                            dates.append(d)
-                            break
-                        except ValueError:
-                            continue
+        for raw in matches:
+            try:
+                dates.append(
+                    datetime.strptime(
+                        raw,
+                        "%b %d, %Y"
+                    ).date()
+                )
+            except ValueError:
+                continue
 
         today = datetime.now(timezone.utc).date()
-        past = sorted({d for d in dates if d <= today})
-        future = sorted({d for d in dates if d > today})
+
+        past = sorted(
+            {d for d in dates if d <= today}
+        )
+        future = sorted(
+            {d for d in dates if d > today}
+        )
 
         if past:
             fallback["last_earnings_date"] = max(past)
+
         if future:
             fallback["next_earnings_date"] = min(future)
 
@@ -691,6 +698,12 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
         nxt_dt = _to_date(mb_fallback.get("next_earnings_date"))
         if nxt_dt:
             profile["next_source"] = "MarketBeat"
+
+    # Defensive invariant: Last Earnings must be a historical date.
+    # Never allow a future scheduled earnings date to leak into this field.
+    if pst_dt and pst_dt > today_date:
+        pst_dt = None
+        profile["past_source"] = "N/A"
 
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
