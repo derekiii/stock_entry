@@ -526,7 +526,13 @@ if ticker_input:
             
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
-            
+
+            # Initialize support variables BEFORE any UI code can reference them.
+            # EMA20/EMA50 are used only as a fallback inside select_best_support().
+            support_candidates = []
+            default_support = float(full_df["Low"].tail(20).min())
+            default_support, support_candidates = select_best_support(full_df, current_price)
+
             # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
@@ -600,7 +606,6 @@ if ticker_input:
                 
                 st.subheader("⚙️ Interactive Formula Adjustments")
                 
-                default_support, support_candidates = select_best_support(full_df, current_price)
                 default_resistance = scraped_matp
                 
                 # Setup session state metrics explicitly on ticker switch
