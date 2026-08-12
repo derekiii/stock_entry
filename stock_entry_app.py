@@ -65,10 +65,21 @@ def fetch_stock_data_cached(ticker_symbol):
     except Exception:
         calendar_dict = {}
 
-    # Historical earnings dates are separate from the upcoming calendar.
+    # Historical earnings: use the actual earnings-history endpoint first.
+    # Yahoo's earnings_dates endpoint can prioritize upcoming estimates, so
+    # also request offset=1 specifically for the most recent reported results.
+    earnings_history = None
+    try:
+        earnings_history = ticker.get_earnings_history()
+    except Exception:
+        try:
+            earnings_history = ticker.earnings_history
+        except Exception:
+            earnings_history = None
+
     earnings_dates = None
     try:
-        earnings_dates = ticker.get_earnings_dates(limit=20)
+        earnings_dates = ticker.get_earnings_dates(limit=50, offset=1)
     except Exception:
         try:
             earnings_dates = ticker.earnings_dates
@@ -85,6 +96,7 @@ def fetch_stock_data_cached(ticker_symbol):
         "info": info_dict,
         "calendar": calendar_dict,
         "earnings_dates": earnings_dates,
+        "earnings_history": earnings_history,
         "quarterly_income": quarterly_income
     }, None
 
@@ -125,13 +137,24 @@ def scrape_finviz_fallback_data(ticker):
                             if len(parts) >= 2:
                                 clean_date_str = f"{parts[0]} {parts[1]}"
                                 current_year = datetime.now().year
-                                formatted_str = f"{clean_date_str} {current_year}"
-                                for fmt in ("%b %d %Y", "%B %d %Y"):
-                                    try:
-                                        fallback["last_earnings_date"] = datetime.strptime(formatted_str, fmt).date()
+                                parsed = None
+                                for year in (current_year, current_year - 1):
+                                    formatted_str = f"{clean_date_str} {year}"
+                                    for fmt in ("%b %d %Y", "%B %d %Y"):
+                                        try:
+                                            candidate = datetime.strptime(formatted_str, fmt).date()
+                                            # A displayed earnings date should not be
+                                            # materially in the future when used as
+                                            # "last earnings".
+                                            if candidate <= datetime.now().date():
+                                                parsed = candidate
+                                                break
+                                        except ValueError:
+                                            continue
+                                    if parsed:
                                         break
-                                    except ValueError:
-                                        continue
+                                if parsed:
+                                    fallback["last_earnings_date"] = parsed
                         except Exception:
                             fallback["last_earnings_date"] = "N/A"
     except Exception: pass
@@ -227,43 +250,64 @@ def _to_date(value):
         return None
 
 
-def get_yahoo_earnings_dates(earnings_dates):
-    """Return most recent past and nearest future earnings dates."""
+def get_yahoo_earnings_dates(earnings_dates, earnings_history=None):
+    """
+    Extract the latest reported earnings date and the nearest upcoming date.
+
+    Yahoo exposes two useful structures:
+      - earnings_history: actual reported quarterly earnings dates
+      - earnings_dates: earnings-calendar dates, which can include estimates
+
+    We prefer earnings_history for the LAST earnings date.
+    """
     today = datetime.now(timezone.utc).date()
     past_dates, future_dates = [], []
 
-    try:
-        if earnings_dates is None:
-            return None, None
+    def collect_dates(obj):
+        result = []
+        if obj is None:
+            return result
 
-        if isinstance(earnings_dates, pd.DataFrame):
-            raw_dates = list(earnings_dates.index)
-        elif isinstance(earnings_dates, pd.Series):
-            raw_dates = list(earnings_dates.index)
-        elif isinstance(earnings_dates, (list, tuple)):
-            raw_dates = list(earnings_dates)
-        else:
+        try:
+            if isinstance(obj, pd.DataFrame):
+                raw_dates = list(obj.index)
+            elif isinstance(obj, pd.Series):
+                raw_dates = list(obj.index)
+            elif isinstance(obj, (list, tuple)):
+                raw_dates = list(obj)
+            else:
+                raw_dates = []
+        except Exception:
             raw_dates = []
 
         for raw in raw_dates:
             d = _to_date(raw)
-            if not d:
-                continue
-            if d <= today:
-                past_dates.append(d)
-            else:
-                future_dates.append(d)
-    except Exception:
-        return None, None
+            if d:
+                result.append(d)
+        return result
+
+    # Actual reported earnings first.
+    history_dates = collect_dates(earnings_history)
+    for d in history_dates:
+        if d <= today:
+            past_dates.append(d)
+
+    # Earnings calendar can supply both past and future dates.
+    calendar_dates = collect_dates(earnings_dates)
+    for d in calendar_dates:
+        if d <= today:
+            past_dates.append(d)
+        else:
+            future_dates.append(d)
 
     return (
-        max(past_dates) if past_dates else None,
-        min(future_dates) if future_dates else None
+        max(set(past_dates)) if past_dates else None,
+        min(set(future_dates)) if future_dates else None
     )
 
 
 def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
-                         cached_financials, finviz_data, mb_fallback):
+                         cached_earnings_history, cached_financials, finviz_data, mb_fallback):
     today_date = datetime.now(timezone.utc).date()
 
     profile = {
@@ -277,7 +321,7 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
     nxt_dt = None
 
     # Last earnings: Yahoo historical earnings dates first.
-    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
+    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates, cached_earnings_history)
 
     if yahoo_past:
         pst_dt = yahoo_past
@@ -511,6 +555,7 @@ if ticker_input:
             calendar = dataset["calendar"]
             quarterly_income = dataset["quarterly_income"]
             earnings_dates = dataset.get("earnings_dates")
+            earnings_history = dataset.get("earnings_history")
             
             chart_df = full_df.tail(63).copy()
             
@@ -554,7 +599,15 @@ if ticker_input:
             target_mean_price = info.get("targetMeanPrice") if info else None
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             
-            earn = get_earnings_profile(ticker_input, calendar, earnings_dates, quarterly_income, finviz_data, mb_data)
+            earn = get_earnings_profile(
+                ticker_input,
+                calendar,
+                earnings_dates,
+                earnings_history,
+                quarterly_income,
+                finviz_data,
+                mb_data
+            )
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
@@ -597,7 +650,11 @@ if ticker_input:
                 st.markdown(f"**Forward P/E:** {fwd_pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**PEG Ratio:** {peg_styled}", unsafe_allow_html=True)
                 st.markdown(f"**MATP Price:** `${scraped_matp:.2f}`")
-                st.markdown(f"**Last Earnings:** {last_earn_styled} <small>[{earn["past_source"]}]</small>", unsafe_allow_html=True)
+                st.markdown(
+                    f"**Last Earnings:** {last_earn_styled} "
+                    f"<small>[{earn['past_source']}]</small>",
+                    unsafe_allow_html=True
+                )
                 st.markdown(f"**Next Earnings:** {next_earn_styled} <small>[{earn["next_source"]}]</small>", unsafe_allow_html=True)
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
