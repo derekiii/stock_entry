@@ -225,71 +225,226 @@ def scrape_stockanalysis_earnings(ticker):
 
 # --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT TARGETS ---
 @st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800)
 def scrape_marketbeat_fallback_data(ticker):
+    """
+    Scrape MarketBeat analyst target history.
+
+    The raw analyst revisions are retained so MATP can be calculated using
+    only revisions made after the latest earnings announcement.
+    """
     fallback = {
-        "trailing_pe": "N/A", 
+        "trailing_pe": "N/A",
         "next_earnings_date": None,
+        "analyst_target_history": [],
         "post_earnings_median_matp": None
     }
+
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
+
     try:
-        response = scraper.get(url, timeout=10)
+        response = scraper.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         if response.status_code != 200:
             alt_url = f"https://www.marketbeat.com/stocks/NASDAQ/{ticker}/forecast/"
-            response = scraper.get(alt_url, timeout=10)
-        if response.status_code != 200: return fallback
-            
-        soup = BeautifulSoup(response.text, 'html.parser')
-        text_content = soup.get_text()
-        pe_match = re.search(r'P/E\s+ratio\s+of\s+(\d+(?:\.\d+)?)', text_content, re.IGNORECASE)
-        if pe_match: fallback["trailing_pe"] = float(pe_match.group(1))
+            response = scraper.get(
+                alt_url,
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+
+        if response.status_code != 200:
+            return fallback
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        text_content = soup.get_text(" ")
+
+        pe_match = re.search(
+            r'P/E\s+ratio\s+of\s+(\d+(?:\.\d+)?)',
+            text_content,
+            re.IGNORECASE
+        )
+        if pe_match:
+            fallback["trailing_pe"] = float(pe_match.group(1))
 
         history_table = None
         for table in soup.find_all("table"):
             first_row = table.find("tr")
             if first_row:
-                header_cells = [cell.text.lower().strip() for cell in first_row.find_all(["th", "td"])]
-                if any("date" in h for h in header_cells) and any("brokerage" in h for h in header_cells):
+                header_cells = [
+                    cell.text.lower().strip()
+                    for cell in first_row.find_all(["th", "td"])
+                ]
+                if (
+                    any("date" in h for h in header_cells)
+                    and any("brokerage" in h for h in header_cells)
+                ):
                     history_table = table
                     break
-                    
+
         if history_table:
-            header_cells = [cell.text.lower().strip() for cell in history_table.find("tr").find_all(["th", "td"])]
-            date_idx = next((i for i, h in enumerate(header_cells) if "date" in h), 0)
-            target_idx = next((i for i, h in enumerate(header_cells) if "target" in h), 3)
-            scraped_dates = []
-            post_earnings_targets = []
-            
+            header_cells = [
+                cell.text.lower().strip()
+                for cell in history_table.find("tr").find_all(["th", "td"])
+            ]
+
+            date_idx = next(
+                (i for i, h in enumerate(header_cells) if "date" in h),
+                0
+            )
+            brokerage_idx = next(
+                (i for i, h in enumerate(header_cells) if "brokerage" in h),
+                None
+            )
+            target_idx = next(
+                (i for i, h in enumerate(header_cells) if "target" in h),
+                3
+            )
+
             for row in history_table.find_all("tr"):
                 cols = row.find_all(["td", "th"])
-                if len(cols) <= max(date_idx, target_idx): continue
+
+                if len(cols) <= max(
+                    date_idx,
+                    target_idx,
+                    brokerage_idx if brokerage_idx is not None else 0
+                ):
+                    continue
+
                 raw_date_str = cols[date_idx].text.strip()
                 raw_target_str = cols[target_idx].text.strip()
-                if "date" in raw_date_str.lower() or "brokerage" in raw_date_str.lower(): continue
-                cleaned_date_str = re.sub(r'^[A-Za-z]+,\s+', '', raw_date_str)
-                cleaned_date_str = re.sub(r'\s+', ' ', cleaned_date_str).replace(",", "").replace(".", "").strip()
-                
+
+                if (
+                    "date" in raw_date_str.lower()
+                    or "brokerage" in raw_date_str.lower()
+                ):
+                    continue
+
+                cleaned_date_str = re.sub(
+                    r'^[A-Za-z]+,\s+',
+                    '',
+                    raw_date_str
+                )
+                cleaned_date_str = (
+                    re.sub(r'\s+', ' ', cleaned_date_str)
+                    .replace(",", "")
+                    .replace(".", "")
+                    .strip()
+                )
+
                 row_date = None
-                for fmt in ("%m/%d/%Y", "%b %d %Y", "%B %d %Y", "%m/%d/%y"):
+                for fmt in (
+                    "%m/%d/%Y",
+                    "%b %d %Y",
+                    "%B %d %Y",
+                    "%m/%d/%y"
+                ):
                     try:
-                        row_date = datetime.strptime(cleaned_date_str, fmt).date()
+                        row_date = datetime.strptime(
+                            cleaned_date_str,
+                            fmt
+                        ).date()
                         break
-                    except ValueError: continue
-                
-                if row_date:
-                    scraped_dates.append(row_date)
-                    final_target_segment = raw_target_str.split("➝")[-1].strip() if "➝" in raw_target_str else raw_target_str
-                    numeric_match = re.search(r'\d+(?:\.\d+)?', final_target_segment.replace(",", ""))
-                    if numeric_match: post_earnings_targets.append(float(numeric_match.group(0)))
-            
-            if scraped_dates:
-                today = datetime.now(timezone.utc).date()
-                futures = [d for d in scraped_dates if d > today]
-                if futures: fallback["next_earnings_date"] = min(futures)
-            if post_earnings_targets: fallback["post_earnings_median_matp"] = statistics.median(post_earnings_targets)
-    except Exception: pass
+                    except ValueError:
+                        continue
+
+                if not row_date:
+                    continue
+
+                final_target_segment = (
+                    raw_target_str.split("➝")[-1].strip()
+                    if "➝" in raw_target_str
+                    else raw_target_str
+                )
+
+                numeric_match = re.search(
+                    r'\d+(?:\.\d+)?',
+                    final_target_segment.replace(",", "")
+                )
+
+                if not numeric_match:
+                    continue
+
+                target_value = float(numeric_match.group(0))
+
+                brokerage = (
+                    cols[brokerage_idx].text.strip()
+                    if brokerage_idx is not None
+                    else "Unknown"
+                )
+
+                fallback["analyst_target_history"].append({
+                    "date": row_date,
+                    "brokerage": brokerage,
+                    "target": target_value
+                })
+
+            # The MarketBeat page also contains upcoming earnings information
+            # in some layouts. Preserve the existing future-date extraction.
+            scraped_dates = [
+                x["date"] for x in fallback["analyst_target_history"]
+            ]
+            today = datetime.now(timezone.utc).date()
+            futures = [d for d in scraped_dates if d > today]
+            if futures:
+                fallback["next_earnings_date"] = min(futures)
+
+    except Exception:
+        pass
+
     return fallback
+
+
+def calculate_post_earnings_matp(marketbeat_data, last_earnings_date):
+    """
+    Calculate MATP using only the latest analyst target from each brokerage
+    after the latest earnings announcement.
+
+    This avoids:
+      - using pre-earnings targets
+      - counting multiple revisions from the same analyst repeatedly
+
+    Returns (MATP, number_of_analysts_used).
+    """
+    if not last_earnings_date:
+        return None, 0
+
+    history = marketbeat_data.get("analyst_target_history", [])
+    if not history:
+        return None, 0
+
+    post_earnings = [
+        row for row in history
+        if row.get("date") and row["date"] > last_earnings_date
+    ]
+
+    if not post_earnings:
+        return None, 0
+
+    # Latest target per brokerage after earnings.
+    latest_by_brokerage = {}
+
+    for row in post_earnings:
+        brokerage = row.get("brokerage") or "Unknown"
+        existing = latest_by_brokerage.get(brokerage)
+
+        if existing is None or row["date"] > existing["date"]:
+            latest_by_brokerage[brokerage] = row
+
+    targets = [
+        row["target"]
+        for row in latest_by_brokerage.values()
+        if isinstance(row.get("target"), (int, float))
+    ]
+
+    if not targets:
+        return None, 0
+
+    return statistics.median(targets), len(targets)
 
 # --- PROFILE MATRICES GENERATORS ---
 def _to_date(value):
@@ -674,8 +829,6 @@ if ticker_input:
             peg_ratio = info.get("pegRatio", "N/A") if info else "N/A"
             if peg_ratio == "N/A": peg_ratio = finviz_data["peg_ratio"]
                 
-            target_mean_price = info.get("targetMeanPrice") if info else None
-            scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             
             earn = get_earnings_profile(
                 ticker_input,
@@ -687,6 +840,25 @@ if ticker_input:
                 stockanalysis_data,
                 mb_data
             )
+
+            target_mean_price = info.get("targetMeanPrice") if info else None
+
+            # MATP is anchored to the actual last earnings announcement.
+            # Only post-earnings analyst targets are considered.
+            post_earnings_matp, matp_analyst_count = calculate_post_earnings_matp(
+                mb_data,
+                _to_date(earn["past_date"])
+            )
+
+            if post_earnings_matp is not None:
+                scraped_matp = post_earnings_matp
+                matp_source = f"MarketBeat post-earnings ({matp_analyst_count} analysts)"
+            elif target_mean_price is not None:
+                scraped_matp = target_mean_price
+                matp_source = "Yahoo targetMeanPrice fallback"
+            else:
+                scraped_matp = current_price
+                matp_source = "Current price fallback"
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
@@ -728,7 +900,7 @@ if ticker_input:
                 st.markdown(f"**Trailing P/E:** {pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**Forward P/E:** {fwd_pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**PEG Ratio:** {peg_styled}", unsafe_allow_html=True)
-                st.markdown(f"**MATP Price:** `${scraped_matp:.2f}`")
+                st.markdown(f"**MATP Price:** `${scraped_matp:.2f}` <small>[{matp_source}]</small>", unsafe_allow_html=True)
                 st.markdown(
                     f"**Last Earnings:** {last_earn_styled} "
                     f"<small>[{earn['past_source']}]</small>",
