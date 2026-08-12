@@ -79,7 +79,7 @@ def fetch_stock_data_cached(ticker_symbol):
 
     earnings_dates = None
     try:
-        earnings_dates = ticker.get_earnings_dates(limit=50, offset=1)
+        earnings_dates = ticker.get_earnings_dates(limit=50, offset=0)
     except Exception:
         try:
             earnings_dates = ticker.earnings_dates
@@ -252,58 +252,55 @@ def _to_date(value):
 
 def get_yahoo_earnings_dates(earnings_dates, earnings_history=None):
     """
-    Extract the latest reported earnings date and the nearest upcoming date.
+    Return the latest actual earnings-calendar announcement date and the
+    nearest future earnings-calendar date.
 
-    Yahoo exposes two useful structures:
-      - earnings_history: actual reported quarterly earnings dates
-      - earnings_dates: earnings-calendar dates, which can include estimates
-
-    We prefer earnings_history for the LAST earnings date.
+    IMPORTANT:
+    earnings_dates is used for announcement dates. earnings_history is NOT
+    used for this field because its dates can represent reporting-period data.
     """
     today = datetime.now(timezone.utc).date()
-    past_dates, future_dates = [], []
+    past_dates = []
+    future_dates = []
 
-    def collect_dates(obj):
-        result = []
-        if obj is None:
-            return result
+    if earnings_dates is None:
+        return None, None
 
-        try:
-            if isinstance(obj, pd.DataFrame):
-                raw_dates = list(obj.index)
-            elif isinstance(obj, pd.Series):
-                raw_dates = list(obj.index)
-            elif isinstance(obj, (list, tuple)):
-                raw_dates = list(obj)
-            else:
-                raw_dates = []
-        except Exception:
+    try:
+        if isinstance(earnings_dates, pd.DataFrame):
+            raw_dates = list(earnings_dates.index)
+        elif isinstance(earnings_dates, pd.Series):
+            raw_dates = list(earnings_dates.index)
+        else:
             raw_dates = []
+    except Exception:
+        raw_dates = []
 
-        for raw in raw_dates:
-            d = _to_date(raw)
-            if d:
-                result.append(d)
-        return result
-
-    # Actual reported earnings first.
-    history_dates = collect_dates(earnings_history)
-    for d in history_dates:
-        if d <= today:
-            past_dates.append(d)
-
-    # Earnings calendar can supply both past and future dates.
-    calendar_dates = collect_dates(earnings_dates)
-    for d in calendar_dates:
+    for raw in raw_dates:
+        d = _to_date(raw)
+        if not d:
+            continue
         if d <= today:
             past_dates.append(d)
         else:
             future_dates.append(d)
 
     return (
-        max(set(past_dates)) if past_dates else None,
-        min(set(future_dates)) if future_dates else None
+        max(past_dates) if past_dates else None,
+        min(future_dates) if future_dates else None
     )
+
+
+def get_earnings_diagnostics(cached_earnings_dates, finviz_data):
+    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
+    return {
+        "yahoo_last": yahoo_past,
+        "yahoo_next": yahoo_next,
+        "finviz_last": (
+            finviz_data.get("last_earnings_date")
+            if finviz_data else "N/A"
+        )
+    }
 
 
 def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
@@ -321,7 +318,7 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
     nxt_dt = None
 
     # Last earnings: Yahoo historical earnings dates first.
-    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates, cached_earnings_history)
+    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
 
     if yahoo_past:
         pst_dt = yahoo_past
