@@ -3,90 +3,93 @@ import yfinance as yf
 import pandas as pd
 import re
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+import time
 import cloudscraper
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 
 # Global system trading parameters
 DEFAULT_GLOBAL_CAPITAL = 6000.00  
 RISK_PERCENT = 0.01       # 1% max risk per trade
 OFFSET_PCT = 0.005        # 0.5% offset for Entry Price
 
-def get_yfinance_session():
-    """
-    Creates a requests Session with realistic browser headers 
-    and strict retry configurations to prevent endless hanging.
-    """
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-    })
-    retries = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    return session
-
 # --- STREAMLIT CACHING ENGINE TO BYPASS CLOUD RATE LIMITS ---
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300)
 def fetch_stock_data_cached(ticker_symbol):
     """
-    Fetches historical data, calendar information, ticker info stats, and financials.
-    Strict timeouts are enforced so the app fails fast if Yahoo hangs.
+    Multi-layer market data engine.
+    Individual Yahoo endpoints can fail independently.
     """
+    ticker_symbol = ticker_symbol.strip().upper()
+    ticker = yf.Ticker(ticker_symbol)
+
+    # Yahoo history can intermittently fail on cloud/shared IPs, so retry.
+    full_df = pd.DataFrame()
+    history_error = None
+    for attempt in range(3):
+        try:
+            full_df = ticker.history(
+                period="2y",
+                interval="1d",
+                auto_adjust=False,
+                actions=False
+            )
+            if not full_df.empty:
+                break
+        except Exception as e:
+            history_error = str(e)
+        if attempt < 2:
+            time.sleep(1.0 * (attempt + 1))
+
+    if full_df.empty:
+        return None, f"Unable to retrieve Yahoo historical prices after 3 attempts. {history_error or ''}".strip()
+
+    full_df.columns = [str(col).strip() for col in full_df.columns]
+    required_cols = {"Open", "High", "Low", "Close"}
+    if not required_cols.issubset(full_df.columns):
+        return None, "Yahoo returned incomplete OHLC history."
+
+    full_df["EMA20"] = full_df["Close"].ewm(span=20, adjust=False).mean()
+    full_df["EMA50"] = full_df["Close"].ewm(span=50, adjust=False).mean()
+    full_df["EMA200"] = full_df["Close"].ewm(span=200, adjust=False).mean()
+
+    # Each endpoint fails independently.
     try:
-        session = get_yfinance_session()
-        ticker = yf.Ticker(ticker_symbol, session=session)
-        
-        # 1. Fetch History with explicit period check
-        full_df = ticker.history(period="1y", interval="1d", timeout=8)
-        if full_df is None or full_df.empty or len(full_df) < 50:
-            return None, f"Insufficient price data returned for symbol '{ticker_symbol}'."
-        
-        full_df.columns = [str(col).strip() for col in full_df.columns]
-        full_df["EMA20"] = full_df["Close"].ewm(span=20, adjust=False).mean()
-        full_df["EMA50"] = full_df["Close"].ewm(span=50, adjust=False).mean()
-        full_df["EMA200"] = full_df["Close"].ewm(span=200, adjust=False).mean()
-        
-        # 2. Extract Key Info Stats Safely
+        info_dict = ticker.info or {}
+    except Exception:
         info_dict = {}
-        try:
-            info_dict = ticker.info
-        except Exception:
-            pass
-            
-        # 3. Pull Earnings Calendar Safely
+
+    try:
+        calendar_dict = ticker.calendar or {}
+    except Exception:
         calendar_dict = {}
-        try:
-            calendar_dict = ticker.calendar
-        except Exception:
-            pass
 
-        # 4. Pull Financials for Trend Stats Safely
+    # Historical earnings dates are separate from the upcoming calendar.
+    earnings_dates = None
+    try:
+        earnings_dates = ticker.get_earnings_dates(limit=20)
+    except Exception:
+        try:
+            earnings_dates = ticker.earnings_dates
+        except Exception:
+            earnings_dates = None
+
+    try:
+        quarterly_income = ticker.quarterly_income_stmt
+    except Exception:
         quarterly_income = None
-        try:
-            quarterly_income = ticker.quarterly_income_stmt
-        except Exception:
-            pass
-            
-        return {
-            "df": full_df,
-            "info": info_dict,
-            "calendar": calendar_dict,
-            "quarterly_income": quarterly_income
-        }, None
 
-    except Exception as e:
-        err_msg = str(e)
-        if "YFRateLimitError" in err_msg or "429" in err_msg:
-            return None, "⚠️ Yahoo Finance API is currently rate-limiting shared Streamlit cloud requests. Please retry in 1 minute."
-        return None, f"Unable to retrieve data for '{ticker_symbol}': {err_msg}"
+    return {
+        "df": full_df,
+        "info": info_dict,
+        "calendar": calendar_dict,
+        "earnings_dates": earnings_dates,
+        "quarterly_income": quarterly_income
+    }, None
 
 # --- SCRAPER ENGINE: FINVIZ COMBINED METRICS SNAPSHOT ---
+@st.cache_data(ttl=1800)
 def scrape_finviz_fallback_data(ticker):
     fallback = {
         "trailing_pe": "N/A",
@@ -97,7 +100,7 @@ def scrape_finviz_fallback_data(ticker):
     url = f"https://finviz.com/quote.ashx?t={ticker}"
     scraper = cloudscraper.create_scraper()
     try:
-        response = scraper.get(url, timeout=5) # 5s strict timeout
+        response = scraper.get(url, timeout=10)
         if response.status_code != 200: return fallback
         soup = BeautifulSoup(response.text, 'html.parser')
         snapshot_table = soup.find("table", class_="snapshot-table2")
@@ -135,6 +138,7 @@ def scrape_finviz_fallback_data(ticker):
     return fallback
 
 # --- SCRAPER FALLBACK ENGINE 2: MARKETBEAT TARGETS ---
+@st.cache_data(ttl=1800)
 def scrape_marketbeat_fallback_data(ticker):
     fallback = {
         "trailing_pe": "N/A", 
@@ -144,10 +148,10 @@ def scrape_marketbeat_fallback_data(ticker):
     url = f"https://www.marketbeat.com/stocks/NYSE/{ticker}/forecast/"
     scraper = cloudscraper.create_scraper()
     try:
-        response = scraper.get(url, timeout=5) # 5s strict timeout
+        response = scraper.get(url, timeout=10)
         if response.status_code != 200:
             alt_url = f"https://www.marketbeat.com/stocks/NASDAQ/{ticker}/forecast/"
-            response = scraper.get(alt_url, timeout=5)
+            response = scraper.get(alt_url, timeout=10)
         if response.status_code != 200: return fallback
             
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -202,32 +206,110 @@ def scrape_marketbeat_fallback_data(ticker):
     return fallback
 
 # --- PROFILE MATRICES GENERATORS ---
-def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finviz_data, mb_fallback):
-    now = datetime.now(timezone.utc)
-    today_date = now.date()  
+def _to_date(value):
+    """Convert common Yahoo/HTML date values into a date."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
+
+
+def get_yahoo_earnings_dates(earnings_dates):
+    """Return most recent past and nearest future earnings dates."""
+    today = datetime.now(timezone.utc).date()
+    past_dates, future_dates = [], []
+
+    try:
+        if earnings_dates is None:
+            return None, None
+
+        if isinstance(earnings_dates, pd.DataFrame):
+            raw_dates = list(earnings_dates.index)
+        elif isinstance(earnings_dates, pd.Series):
+            raw_dates = list(earnings_dates.index)
+        elif isinstance(earnings_dates, (list, tuple)):
+            raw_dates = list(earnings_dates)
+        else:
+            raw_dates = []
+
+        for raw in raw_dates:
+            d = _to_date(raw)
+            if not d:
+                continue
+            if d <= today:
+                past_dates.append(d)
+            else:
+                future_dates.append(d)
+    except Exception:
+        return None, None
+
+    return (
+        max(past_dates) if past_dates else None,
+        min(future_dates) if future_dates else None
+    )
+
+
+def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
+                         cached_financials, finviz_data, mb_fallback):
+    today_date = datetime.now(timezone.utc).date()
+
     profile = {
         "past_date": "N/A", "past_elapsed": "N/A", "past_days_val": None,
         "next_date": "N/A", "next_days": "N/A", "next_days_val": None,
+        "past_source": "N/A", "next_source": "N/A",
         "trend_str": "", "is_3q_uptrend": False
     }
+
     pst_dt = None
     nxt_dt = None
-    
-    if finviz_data["last_earnings_date"] != "N/A":
-        pst_dt = finviz_data["last_earnings_date"]
 
+    # Last earnings: Yahoo historical earnings dates first.
+    yahoo_past, yahoo_next = get_yahoo_earnings_dates(cached_earnings_dates)
+
+    if yahoo_past:
+        pst_dt = yahoo_past
+        profile["past_source"] = "Yahoo"
+    elif finviz_data.get("last_earnings_date") != "N/A":
+        pst_dt = _to_date(finviz_data.get("last_earnings_date"))
+        if pst_dt:
+            profile["past_source"] = "Finviz"
+
+    # Next earnings: Yahoo calendar first.
     try:
         if cached_calendar and "Earnings Date" in cached_calendar:
             dates = cached_calendar["Earnings Date"]
-            if isinstance(dates, list) and len(dates) > 0:
-                parsed_dates = [d.date() if isinstance(d, datetime) else d for d in dates]
-                parsed_dates.sort()
-                futures = [d for d in parsed_dates if d >= today_date]
-                if futures: nxt_dt = futures[0]
-    except Exception: pass
+            if isinstance(dates, (list, tuple, pd.Series)):
+                parsed = sorted(
+                    d for d in (_to_date(x) for x in dates) if d
+                )
+                futures = [d for d in parsed if d >= today_date]
+                if futures:
+                    nxt_dt = futures[0]
+                    profile["next_source"] = "Yahoo"
+    except Exception:
+        pass
 
-    if not nxt_dt and mb_fallback["next_earnings_date"]: 
-        nxt_dt = mb_fallback["next_earnings_date"]
+    if not nxt_dt and yahoo_next:
+        nxt_dt = yahoo_next
+        profile["next_source"] = "Yahoo"
+
+    if not nxt_dt and mb_fallback.get("next_earnings_date"):
+        nxt_dt = _to_date(mb_fallback.get("next_earnings_date"))
+        if nxt_dt:
+            profile["next_source"] = "MarketBeat"
 
     if pst_dt:
         profile["past_date"] = pst_dt.strftime("%b %d, %Y")
@@ -237,7 +319,10 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finv
     if nxt_dt:
         profile["next_date"] = nxt_dt.strftime("%b %d, %Y")
         profile["next_days_val"] = (nxt_dt - today_date).days
-        profile["next_days"] = f"{profile['next_days_val']}d away" if profile['next_days_val'] > 0 else "Today"
+        profile["next_days"] = (
+            f"{profile['next_days_val']}d away"
+            if profile["next_days_val"] > 0 else "Today"
+        )
 
     try:
         q_income = cached_financials
@@ -247,13 +332,149 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_financials, finv
             pct_values = []
             for i in range(min(3, len(net_incomes) - 1)):
                 prev = net_incomes[i + 1]
-                pct_values.append(((net_incomes[i] - prev) / abs(prev)) * 100 if prev else 0.0)
+                pct_values.append(
+                    ((net_incomes[i] - prev) / abs(prev)) * 100 if prev else 0.0
+                )
             pct_values.reverse()
-            trend_formatted = [f"{'▲' if p>0 else '▼' if p<0 else '►'} {int(p)}%" for p in pct_values]
+            trend_formatted = [
+                f"{'▲' if p > 0 else '▼' if p < 0 else '►'} {int(p)}%"
+                for p in pct_values
+            ]
             profile["trend_str"] = " | Trends: " + " -> ".join(trend_formatted)
-            if len(pct_values) >= 3 and all(p > 0 for p in pct_values): profile["is_3q_uptrend"] = True
-    except Exception: pass
+            profile["is_3q_uptrend"] = len(pct_values) >= 3 and all(p > 0 for p in pct_values)
+    except Exception:
+        pass
+
     return profile
+
+
+def find_strong_support_levels(df, current_price, lookback=180,
+                               pivot_window=3, tolerance_pct=0.012):
+    """
+    Detect recent swing-low support zones below current price.
+
+    A support zone becomes stronger when it has:
+    - multiple swing-low touches
+    - recent tests
+    - bullish rejection from the low
+    - above-normal volume on a test
+
+    The returned candidates are ranked by significance first and proximity
+    second, so the app doesn't blindly choose the nearest weak low.
+    """
+    if df is None or df.empty:
+        return []
+
+    data = df.tail(lookback).copy()
+    if len(data) < pivot_window * 2 + 5:
+        return []
+
+    lows = pd.to_numeric(data["Low"], errors="coerce")
+    highs = pd.to_numeric(data["High"], errors="coerce")
+    closes = pd.to_numeric(data["Close"], errors="coerce")
+    volumes = (
+        pd.to_numeric(data["Volume"], errors="coerce")
+        if "Volume" in data.columns else None
+    )
+
+    candidates = []
+
+    for i in range(pivot_window, len(data) - pivot_window):
+        low = lows.iloc[i]
+        if pd.isna(low) or low >= current_price:
+            continue
+
+        left = lows.iloc[i - pivot_window:i]
+        right = lows.iloc[i + 1:i + pivot_window + 1]
+
+        if low <= left.min() and low <= right.min():
+            high = highs.iloc[i]
+            close = closes.iloc[i]
+            candle_range = max(high - low, 1e-9)
+            rejection = max(0.0, min(1.0, (close - low) / candle_range))
+
+            volume_factor = 1.0
+            if volumes is not None:
+                recent_vol = volumes.iloc[max(0, i - 20):i + 1]
+                median_vol = recent_vol.median()
+                if pd.notna(median_vol) and median_vol > 0 and pd.notna(volumes.iloc[i]):
+                    volume_factor = min(1.5, max(0.7, volumes.iloc[i] / median_vol))
+
+            recency_days = len(data) - 1 - i
+            recency_factor = 1.0 / (1.0 + recency_days / 45.0)
+
+            candidates.append({
+                "price": float(low),
+                "rejection": rejection,
+                "volume_factor": float(volume_factor),
+                "recency_factor": float(recency_factor),
+                "date": data.index[i],
+            })
+
+    if not candidates:
+        return []
+
+    # Cluster lows within 1.2% into one support zone.
+    zones = []
+    for c in sorted(candidates, key=lambda x: x["price"], reverse=True):
+        assigned = None
+        for zone in zones:
+            if abs(c["price"] - zone["price"]) / zone["price"] <= tolerance_pct:
+                assigned = zone
+                break
+        if assigned:
+            assigned["members"].append(c)
+            assigned["price"] = sum(x["price"] for x in assigned["members"]) / len(assigned["members"])
+        else:
+            zones.append({"price": c["price"], "members": [c]})
+
+    scored = []
+    for zone in zones:
+        members = zone["members"]
+        touches = len(members)
+        recency = max(x["recency_factor"] for x in members)
+        rejection = sum(x["rejection"] for x in members) / touches
+        volume_factor = sum(x["volume_factor"] for x in members) / touches
+
+        score = (
+            2.5 * min(touches, 4)
+            + 2.0 * recency
+            + 1.5 * rejection
+            + 1.0 * volume_factor
+        )
+
+        distance_pct = (current_price - zone["price"]) / current_price
+
+        scored.append({
+            "price": zone["price"],
+            "score": score,
+            "touches": touches,
+            "distance_pct": distance_pct,
+            "last_test": max(x["date"] for x in members),
+        })
+
+    scored = [x for x in scored if x["price"] < current_price]
+    scored.sort(key=lambda x: (x["score"], -x["distance_pct"]), reverse=True)
+
+    return scored[:8]
+
+
+def select_best_support(df, current_price):
+    candidates = find_strong_support_levels(df, current_price)
+
+    if candidates:
+        return candidates[0]["price"], candidates
+
+    # EMA is now only a safety fallback, not the primary support engine.
+    ema20 = float(df["EMA20"].iloc[-1])
+    ema50 = float(df["EMA50"].iloc[-1])
+    below = [x for x in (ema20, ema50) if x < current_price]
+
+    if below:
+        return max(below), []
+
+    return float(df["Low"].tail(20).min()), []
+
 
 # --- STREAMLIT WEB APP UI INTERFACE ---
 st.set_page_config(page_title="Entry Matrix Terminal", layout="wide", initial_sidebar_state="expanded")
@@ -274,11 +495,14 @@ with st.sidebar:
     st.markdown("---")
 
 if ticker_input:
-    with st.spinner(f"Analyzing {ticker_input} profiles..."):
+    with st.spinner(f"Analyzing {ticker_input} profiles safely from multi-layer data channels..."):
         dataset, error_msg = fetch_stock_data_cached(ticker_input)
         
         if error_msg:
             st.error(error_msg)
+            st.stop()
+        if dataset is None:
+            st.warning("No structural profile returned from core cache pool layer. Try again in a brief moment.")
             st.stop()
             
         try:
@@ -286,6 +510,7 @@ if ticker_input:
             info = dataset["info"]
             calendar = dataset["calendar"]
             quarterly_income = dataset["quarterly_income"]
+            earnings_dates = dataset.get("earnings_dates")
             
             chart_df = full_df.tail(63).copy()
             
@@ -302,6 +527,7 @@ if ticker_input:
             extracted_atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
             current_price = float(full_df["Close"].iloc[-1])
             
+            # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
             mb_data = scrape_marketbeat_fallback_data(ticker_input)
             
@@ -322,7 +548,7 @@ if ticker_input:
             target_mean_price = info.get("targetMeanPrice") if info else None
             scraped_matp = mb_data["post_earnings_median_matp"] or target_mean_price or current_price
             
-            earn = get_earnings_profile(ticker_input, calendar, quarterly_income, finviz_data, mb_data)
+            earn = get_earnings_profile(ticker_input, calendar, earnings_dates, quarterly_income, finviz_data, mb_data)
             
             def style_metric_val(val, threshold, is_peg=False):
                 if val == "N/A" or not isinstance(val, (int, float)): return f"`{val}`"
@@ -348,15 +574,25 @@ if ticker_input:
                 st.subheader("📊 Core Market Analysis Profile")
                 st.metric("Current Price", f"${current_price:.2f}")
                 st.markdown(f"**Sector Info:** `{detailed_sector_str}`")
-                trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "ext🟨 **NO CLEAR TREND / CONSOLIDATION**"
+                trend_status = "🟩 **PERFECT UPTREND (EMA STACK)**" if (ema20 > ema50 > ema200) else "🟥 **NO CLEAR TREND / CONSOLIDATION**"
                 st.markdown(f"**Trend State:** {trend_status}")
+
+                if support_candidates:
+                    best = support_candidates[0]
+                    st.markdown(
+                        f"**Auto Support:** `${best['price']:.2f}` "
+                        f"({best['touches']} swing-low touch(es), "
+                        f"{best['distance_pct']*100:.1f}% below price)"
+                    )
+                else:
+                    st.markdown("**Auto Support:** `EMA fallback`")
                 
                 st.markdown(f"**Trailing P/E:** {pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**Forward P/E:** {fwd_pe_styled}", unsafe_allow_html=True)
                 st.markdown(f"**PEG Ratio:** {peg_styled}", unsafe_allow_html=True)
                 st.markdown(f"**MATP Price:** `${scraped_matp:.2f}`")
-                st.markdown(f"**Last Earnings:** {last_earn_styled}", unsafe_allow_html=True)
-                st.markdown(f"**Next Earnings:** {next_earn_styled}", unsafe_allow_html=True)
+                st.markdown(f"**Last Earnings:** {last_earn_styled} <small>[{earn["past_source"]}]</small>", unsafe_allow_html=True)
+                st.markdown(f"**Next Earnings:** {next_earn_styled} <small>[{earn["next_source"]}]</small>", unsafe_allow_html=True)
                 
                 qh_text = "🟢 **3Q Continuous Growth Uptrend**" if earn['is_3q_uptrend'] else "📋 **Mixed Growth Matrix**"
                 st.markdown(f"**Quarterly Income Health:** {qh_text} {earn['trend_str']}")
@@ -364,18 +600,20 @@ if ticker_input:
                 
                 st.subheader("⚙️ Interactive Formula Adjustments")
                 
-                default_support = ema20 if abs(current_price - ema20) < abs(current_price - ema50) else ema50
+                default_support, support_candidates = select_best_support(full_df, current_price)
                 default_resistance = scraped_matp
                 
+                # Setup session state metrics explicitly on ticker switch
                 if "prev_ticker" not in st.session_state or st.session_state.prev_ticker != ticker_input:
                     st.session_state.prev_ticker = ticker_input
                     st.session_state.val_support = float(default_support)
                     st.session_state.val_resistance = float(default_resistance)
                     st.session_state.val_entry = float(default_support * (1 + OFFSET_PCT))
                     st.session_state.val_target = float(default_resistance * (1 - 0.002))
-                    st.session_state.val_atr_mult = 1.5
+                    st.session_state.val_atr_mult = 1.5  # Initialized ATR multiplier state
                     st.session_state.val_stop = float(default_support - (1.5 * extracted_atr))
 
+                # --- INSTANT SYNCHRONIZATION CALLBACK LAYERS ---
                 def on_support_change():
                     st.session_state.val_entry = st.session_state.val_support * (1 + OFFSET_PCT)
                     st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
@@ -384,6 +622,7 @@ if ticker_input:
                     st.session_state.val_target = st.session_state.val_resistance * (1 - 0.002)
 
                 def on_mult_change():
+                    # Recalculates stop loss directly when the multiplier number changes
                     st.session_state.val_stop = st.session_state.val_support - (st.session_state.val_atr_mult * extracted_atr)
 
                 grid_col1, grid_col2 = st.columns(2)
