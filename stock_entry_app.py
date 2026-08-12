@@ -624,132 +624,310 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
     return profile
 
 
-def find_strong_support_levels(df, current_price, lookback=180,
-                               pivot_window=3, tolerance_pct=0.012):
-    """
-    Detect recent swing-low support zones below current price.
-
-    A support zone becomes stronger when it has:
-    - multiple swing-low touches
-    - recent tests
-    - bullish rejection from the low
-    - above-normal volume on a test
-
-    The returned candidates are ranked by significance first and proximity
-    second, so the app doesn't blindly choose the nearest weak low.
-    """
+def _support_touch_strength(df, level, tolerance_pct=0.012):
     if df is None or df.empty:
-        return []
+        return 0, 0.0
+    recent = df.tail(180)
+    lows = pd.to_numeric(recent["Low"], errors="coerce").dropna()
+    if lows.empty:
+        return 0, 0.0
 
-    data = df.tail(lookback).copy()
-    if len(data) < pivot_window * 2 + 5:
-        return []
+    hits = lows[((lows - level).abs() / level) <= tolerance_pct]
+    recency_score = 0.0
+    for idx in hits.index:
+        try:
+            days_ago = max(0, (recent.index[-1] - idx).days)
+        except Exception:
+            days_ago = 180
+        recency_score += max(0.0, 1.0 - days_ago / 180.0)
+    return int(len(hits)), recency_score
 
-    lows = pd.to_numeric(data["Low"], errors="coerce")
-    highs = pd.to_numeric(data["High"], errors="coerce")
-    closes = pd.to_numeric(data["Close"], errors="coerce")
-    volumes = (
-        pd.to_numeric(data["Volume"], errors="coerce")
-        if "Volume" in data.columns else None
-    )
 
+def _build_price_support_candidates(df, current_price):
     candidates = []
+    recent = df.tail(180).copy()
+    lows = pd.to_numeric(recent["Low"], errors="coerce")
 
-    for i in range(pivot_window, len(data) - pivot_window):
-        low = lows.iloc[i]
-        if pd.isna(low) or low >= current_price:
-            continue
+    for window in (3, 5):
+        rolling_min = lows.rolling(
+            window * 2 + 1, center=True, min_periods=1
+        ).min()
+        swing_idx = recent.index[lows.eq(rolling_min)]
 
-        left = lows.iloc[i - pivot_window:i]
-        right = lows.iloc[i + 1:i + pivot_window + 1]
+        for idx in swing_idx:
+            level = float(recent.loc[idx, "Low"])
+            if level >= current_price:
+                continue
 
-        if low <= left.min() and low <= right.min():
-            high = highs.iloc[i]
-            close = closes.iloc[i]
-            candle_range = max(high - low, 1e-9)
-            rejection = max(0.0, min(1.0, (close - low) / candle_range))
+            touches, recency = _support_touch_strength(
+                recent, level, tolerance_pct=0.012
+            )
+            distance_pct = (current_price - level) / current_price
 
-            volume_factor = 1.0
-            if volumes is not None:
-                recent_vol = volumes.iloc[max(0, i - 20):i + 1]
-                median_vol = recent_vol.median()
-                if pd.notna(median_vol) and median_vol > 0 and pd.notna(volumes.iloc[i]):
-                    volume_factor = min(1.5, max(0.7, volumes.iloc[i] / median_vol))
-
-            recency_days = len(data) - 1 - i
-            recency_factor = 1.0 / (1.0 + recency_days / 45.0)
+            try:
+                row = recent.loc[idx]
+                candle_range = max(
+                    float(row["High"] - row["Low"]), 1e-9
+                )
+                rejection = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (float(row["Close"]) - float(row["Low"]))
+                        / candle_range
+                    )
+                )
+            except Exception:
+                rejection = 0.5
 
             candidates.append({
-                "price": float(low),
+                "price": level,
+                "type": "Price Support",
+                "touches": touches,
+                "recency": recency,
                 "rejection": rejection,
-                "volume_factor": float(volume_factor),
-                "recency_factor": float(recency_factor),
-                "date": data.index[i],
+                "distance_pct": distance_pct,
             })
 
-    if not candidates:
-        return []
-
-    # Cluster lows within 1.2% into one support zone.
+    # Cluster price levels within 1.5%.
+    candidates.sort(key=lambda x: x["price"], reverse=True)
     zones = []
-    for c in sorted(candidates, key=lambda x: x["price"], reverse=True):
-        assigned = None
-        for zone in zones:
-            if abs(c["price"] - zone["price"]) / zone["price"] <= tolerance_pct:
-                assigned = zone
+
+    for c in candidates:
+        matched = None
+        for z in zones:
+            if abs(c["price"] - z["price"]) / z["price"] <= 0.015:
+                matched = z
                 break
-        if assigned:
-            assigned["members"].append(c)
-            assigned["price"] = sum(x["price"] for x in assigned["members"]) / len(assigned["members"])
+
+        if matched:
+            old_touches = matched["touches"]
+            new_touches = old_touches + c["touches"]
+            if new_touches:
+                matched["price"] = (
+                    matched["price"] * old_touches
+                    + c["price"] * c["touches"]
+                ) / new_touches
+            matched["touches"] = new_touches
+            matched["recency"] = max(
+                matched["recency"], c["recency"]
+            )
+            matched["rejection"] = max(
+                matched["rejection"], c["rejection"]
+            )
+            matched["distance_pct"] = (
+                current_price - matched["price"]
+            ) / current_price
         else:
-            zones.append({"price": c["price"], "members": [c]})
+            zones.append(c)
 
-    scored = []
-    for zone in zones:
-        members = zone["members"]
-        touches = len(members)
-        recency = max(x["recency_factor"] for x in members)
-        rejection = sum(x["rejection"] for x in members) / touches
-        volume_factor = sum(x["volume_factor"] for x in members) / touches
+    return zones
 
-        score = (
-            2.5 * min(touches, 4)
-            + 2.0 * recency
-            + 1.5 * rejection
-            + 1.0 * volume_factor
+
+def _score_support_candidate(
+    candidate, current_price, ema20, ema50, ema200, atr
+):
+    level = candidate["price"]
+    atr_distance = (
+        (current_price - level) / atr
+        if atr > 0 else 999.0
+    )
+
+    # Proximity is deliberately dominant for ENTRY support.
+    if atr_distance <= 1.5:
+        proximity = max(
+            0.35,
+            1.0 - abs(atr_distance - 0.75) / 1.5
         )
+    elif atr_distance <= 2.5:
+        proximity = 0.30
+    else:
+        proximity = 0.03
 
-        distance_pct = (current_price - zone["price"]) / current_price
+    touch_score = min(candidate["touches"], 5) / 5.0
+    recency_score = min(candidate["recency"], 5.0) / 5.0
+    rejection_score = candidate.get("rejection", 0.5)
 
-        scored.append({
-            "price": zone["price"],
-            "score": score,
-            "touches": touches,
-            "distance_pct": distance_pct,
-            "last_test": max(x["date"] for x in members),
-        })
+    ema_bonus = 0.0
+    if abs(level - ema20) / current_price <= 0.012:
+        ema_bonus += 0.20
+    if abs(level - ema50) / current_price <= 0.012:
+        ema_bonus += 0.10
+    if abs(level - ema200) / current_price <= 0.015:
+        ema_bonus += 0.05
 
-    scored = [x for x in scored if x["price"] < current_price]
-    scored.sort(key=lambda x: (x["score"], -x["distance_pct"]), reverse=True)
+    candidate["atr_distance"] = atr_distance
+    candidate["ema_confluence"] = ema_bonus
+    candidate["score"] = (
+        0.40 * proximity
+        + 0.25 * touch_score
+        + 0.20 * recency_score
+        + 0.10 * rejection_score
+        + 0.05 * min(1.0, ema_bonus * 2.0)
+    )
+    return candidate
 
-    return scored[:8]
+
+def find_three_tier_supports(df, current_price):
+    """
+    Three support tiers:
+      Entry    = nearest credible support suitable for a current swing entry
+      Secondary = next meaningful lower support
+      Major    = deeper structural support
+    """
+    ema20 = float(df["EMA20"].iloc[-1])
+    ema50 = float(df["EMA50"].iloc[-1])
+    ema200 = float(df["EMA200"].iloc[-1])
+
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"] - df["Close"].shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = float(
+        tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
+    )
+
+    candidates = _build_price_support_candidates(
+        df, current_price
+    )
+
+    # Add dynamic supports as candidates, but let the scoring decide.
+    for name, value in (
+        ("EMA20", ema20),
+        ("EMA50", ema50),
+        ("EMA200", ema200),
+    ):
+        if value < current_price:
+            touches, recency = _support_touch_strength(
+                df.tail(180), value, tolerance_pct=0.012
+            )
+            candidates.append({
+                "price": value,
+                "type": name,
+                "touches": touches,
+                "recency": recency,
+                "rejection": 0.5,
+                "distance_pct": (
+                    current_price - value
+                ) / current_price,
+            })
+
+    candidates = [
+        _score_support_candidate(
+            c, current_price, ema20, ema50, ema200, atr
+        )
+        for c in candidates
+        if c["price"] < current_price
+    ]
+
+    # Deduplicate close levels.
+    candidates.sort(key=lambda x: x["price"], reverse=True)
+    deduped = []
+    for c in candidates:
+        if not any(
+            abs(c["price"] - x["price"]) / x["price"] <= 0.008
+            for x in deduped
+        ):
+            deduped.append(c)
+
+    # ENTRY: prefer a credible level within 1.5 ATR.
+    near = [c for c in deduped if c["atr_distance"] <= 1.5]
+
+    if near:
+        near.sort(
+            key=lambda x: (x["score"], -x["distance_pct"]),
+            reverse=True
+        )
+        entry = near[0]
+    else:
+        medium = [
+            c for c in deduped
+            if c["atr_distance"] <= 2.5
+        ]
+        medium.sort(
+            key=lambda x: (x["score"], -x["distance_pct"]),
+            reverse=True
+        )
+        entry = medium[0] if medium else None
+
+    # SECONDARY: nearest meaningful level below entry.
+    secondary = None
+    if entry:
+        lower = [
+            c for c in deduped
+            if c["price"] < entry["price"] * 0.985
+        ]
+        lower.sort(
+            key=lambda x: (x["distance_pct"], -x["score"])
+        )
+        secondary = lower[0] if lower else None
+
+    # MAJOR: strongest repeated price support, irrespective of distance.
+    structural = [
+        c for c in deduped
+        if c["type"] == "Price Support"
+        and c["touches"] >= 2
+    ]
+    structural.sort(
+        key=lambda x: (
+            x["touches"] * 2
+            + x["recency"]
+            + x["rejection"]
+        ),
+        reverse=True
+    )
+    major = structural[0] if structural else None
+
+    if major and entry:
+        if abs(major["price"] - entry["price"]) / entry["price"] <= 0.015:
+            alternatives = [
+                c for c in structural
+                if abs(c["price"] - entry["price"])
+                / entry["price"] > 0.015
+            ]
+            major = alternatives[0] if alternatives else None
+
+    return {
+        "entry": entry,
+        "secondary": secondary,
+        "major": major,
+        "atr": atr,
+        "all_candidates": deduped[:12],
+    }
+
+
+def find_strong_support_levels(
+    df, current_price, lookback=180,
+    pivot_window=3, tolerance_pct=0.012
+):
+    """Backward-compatible wrapper."""
+    return find_three_tier_supports(
+        df, current_price
+    )["all_candidates"]
 
 
 def select_best_support(df, current_price):
-    candidates = find_strong_support_levels(df, current_price)
+    tiers = find_three_tier_supports(df, current_price)
 
-    if candidates:
-        return candidates[0]["price"], candidates
+    if tiers["entry"]:
+        return (
+            tiers["entry"]["price"],
+            tiers["all_candidates"]
+        )
 
-    # EMA is now only a safety fallback, not the primary support engine.
     ema20 = float(df["EMA20"].iloc[-1])
     ema50 = float(df["EMA50"].iloc[-1])
     below = [x for x in (ema20, ema50) if x < current_price]
 
     if below:
-        return max(below), []
+        return max(below), tiers["all_candidates"]
 
-    return float(df["Low"].tail(20).min()), []
+    return (
+        float(df["Low"].tail(20).min()),
+        tiers["all_candidates"]
+    )
 
 
 # --- STREAMLIT WEB APP UI INTERFACE ---
@@ -808,7 +986,12 @@ if ticker_input:
             # EMA20/EMA50 are used only as a fallback inside select_best_support().
             support_candidates = []
             default_support = float(full_df["Low"].tail(20).min())
-            default_support, support_candidates = select_best_support(full_df, current_price)
+            default_support, support_candidates = select_best_support(
+                full_df, current_price
+            )
+            support_tiers = find_three_tier_supports(
+                full_df, current_price
+            )
 
             # Singular parsing pipeline for fundamentals and last earnings date
             finviz_data = scrape_finviz_fallback_data(ticker_input)
@@ -889,10 +1072,34 @@ if ticker_input:
 
                 if support_candidates:
                     best = support_candidates[0]
+                    entry_tier = support_tiers.get("entry")
+                    secondary_tier = support_tiers.get("secondary")
+                    major_tier = support_tiers.get("major")
+
+                    def _support_label(tier):
+                        if not tier:
+                            return "N/A"
+                        return (
+                            f"${tier['price']:.2f} "
+                            f"[{tier['type']}]"
+                        )
+
                     st.markdown(
-                        f"**Auto Support:** `${best['price']:.2f}` "
-                        f"({best['touches']} swing-low touch(es), "
-                        f"{best['distance_pct']*100:.1f}% below price)"
+                        f"**🟢 Entry Support:** `{
+_support_label(entry_tier)}`"
+                    )
+                    st.markdown(
+                        f"**🟡 Secondary Support:** `{
+_support_label(secondary_tier)}`"
+                    )
+                    st.markdown(
+                        f"**🔵 Major Support:** `{
+_support_label(major_tier)}`"
+                    )
+                    st.caption(
+                        f"ATR-based proximity + price structure + recency + "
+                        f"touches + EMA confluence; "
+                        f"{len(support_candidates)} candidates evaluated."
                     )
                 else:
                     st.markdown("**Auto Support:** `EMA fallback`")
