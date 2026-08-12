@@ -197,9 +197,14 @@ def scrape_stockanalysis_earnings(ticker):
 
         if match:
             try:
-                fallback["last_earnings_date"] = datetime.strptime(
+                parsed = datetime.strptime(
                     match.group(1), "%b %d, %Y"
                 ).date()
+
+                if parsed > datetime.now(timezone.utc).date():
+                    fallback["next_earnings_date"] = parsed
+                else:
+                    fallback["last_earnings_date"] = parsed
             except ValueError:
                 pass
 
@@ -211,9 +216,14 @@ def scrape_stockanalysis_earnings(ticker):
             )
             if match:
                 try:
-                    fallback["last_earnings_date"] = datetime.strptime(
+                    parsed = datetime.strptime(
                         match.group(1), "%b %d, %Y"
                     ).date()
+
+                    if parsed > datetime.now(timezone.utc).date():
+                        fallback["next_earnings_date"] = parsed
+                    else:
+                        fallback["last_earnings_date"] = parsed
                 except ValueError:
                     pass
 
@@ -518,6 +528,10 @@ def get_earnings_diagnostics(cached_earnings_dates, finviz_data, stockanalysis_d
             stockanalysis_data.get("last_earnings_date")
             if stockanalysis_data else None
         ),
+        "stockanalysis_next": (
+            stockanalysis_data.get("next_earnings_date")
+            if stockanalysis_data else None
+        ),
         "finviz_last": (
             finviz_data.get("last_earnings_date")
             if finviz_data else "N/A"
@@ -555,8 +569,13 @@ def get_earnings_profile(ticker_symbol, cached_calendar, cached_earnings_dates,
         pst_dt = yahoo_past
         profile["past_source"] = "Yahoo"
     elif stockanalysis_data.get("last_earnings_date"):
-        pst_dt = _to_date(stockanalysis_data.get("last_earnings_date"))
-        if pst_dt:
+        candidate = _to_date(
+            stockanalysis_data.get("last_earnings_date")
+        )
+        # StockAnalysis' overview "Earnings Date" can represent the next
+        # scheduled earnings event. Never treat a future date as "Last Earnings".
+        if candidate and candidate <= today_date:
+            pst_dt = candidate
             profile["past_source"] = "StockAnalysis"
     elif finviz_data.get("last_earnings_date") != "N/A":
         pst_dt = _to_date(finviz_data.get("last_earnings_date"))
